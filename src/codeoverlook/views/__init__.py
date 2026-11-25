@@ -10,6 +10,7 @@ from codeoverlook.views.markdown import (
     format_source_block,
 )
 from codeoverlook.views.mermaid import render_block_mermaid, render_coverage_mermaid
+from codeoverlook.views.workbench import render_workbench_html
 
 __all__ = [
     "format_findings_lines",
@@ -19,4 +20,5 @@ __all__ = [
     "render_atlas_html",
     "render_block_mermaid",
     "render_coverage_mermaid",
+    "render_workbench_html",
 ]
