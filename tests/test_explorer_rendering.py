@@ -104,6 +104,9 @@ def test_explorer_layout_levels_bands_and_violations(sample_repo: Path) -> None:
     assert len(model["bands"]) >= 2
     assert all("prod_loc" in band and "avg_coverage_pct" in band for band in model["bands"])
     assert "cross_edges" in model["symbol_graph"]
+    assert "budget" in model["symbol_graph"]
+    assert model["profile"]["size_tier"] == "micro"
+    assert model["profile"]["recommended_density"] == "spacious"
 
     blocks_by_id = {b["id"]: b for b in model["blocks"]}
     # `ui` depends on `engine` and `storage`, so `ui` sits in L1 above `storage`.
@@ -143,7 +146,10 @@ def test_html_explorer_and_workbench_render_controls_and_fullscreen(sample_repo:
     assert 'id="diag-card"' in full_html
     assert 'id="feature-chips"' in full_html
     assert 'data-overlay="weaknesses"' in full_html
+    assert 'data-density="compact"' in full_html
+    assert 'data-density="detailed"' in full_html
     assert 'data-edgescope="hop2"' in full_html
+    assert 'id="pill-scale"' in full_html
     assert 'id="quick-jump-input"' in full_html
     assert 'id="minimap-box"' in full_html
     assert 'id="hover-popover"' in full_html
@@ -154,6 +160,10 @@ def test_html_explorer_and_workbench_render_controls_and_fullscreen(sample_repo:
     assert "computeEdgePaths" in full_html
     assert "renderModulesSvg" in full_html
     assert "centerOnNode" in full_html
+    assert "getDensitySpec" in full_html
+    assert "toggleBandCollapse" in full_html
+    assert "ResizeObserver" in full_html
+    assert "resolveDensity" in full_html
     assert "Tooling &amp; Scripts" in full_html or "Tooling & Scripts" in full_html
     assert "IMPORTS FLOW DOWN" in full_html
     assert "Packages &amp; Bricks" in full_html or "Packages & Bricks" in full_html
@@ -261,3 +271,74 @@ def test_semantic_architecture_analyzer_layers_tooling_and_weaknesses() -> None:
     assert any(d["kind"] == "CYCLE" for d in arch["diagnosis"])
     assert any(d["kind"] == "GOD-MODULE" for d in arch["diagnosis"])
     assert any(d["kind"] == "TOOLING" for d in arch["diagnosis"])
+
+
+def test_architecture_scales_from_micro_to_large_monorepo() -> None:
+    """Verify project profiles and thresholds adapt cleanly across repository scales."""
+    micro_arch = analyze_architecture(
+        blocks_payload=[
+            {
+                "id": "pkg",
+                "prod_files": 4,
+                "prod_loc": 280,
+                "file_coverage_pct": 100.0,
+                "sensitive_sinks": 0,
+                "untested_sinks": 0,
+                "external_libs": [],
+            }
+        ],
+        block_edges=[],
+        packages_payload=[{"id": "pkg::root", "block_id": "pkg"}],
+        modules_payload=[
+            {
+                "path": f"mod_{i}.py",
+                "block_id": "pkg",
+                "loc": 70,
+                "imports": [],
+                "imported_by": [],
+                "sinks": 0,
+                "tested": True,
+            }
+            for i in range(4)
+        ],
+        cycles=[],
+        violations=[],
+    )
+    m_prof = micro_arch["profile"]
+    assert m_prof["size_tier"] == "micro"
+    assert m_prof["recommended_level"] == "modules"
+    assert m_prof["recommended_density"] == "spacious"
+
+    large_blocks = [
+        {
+            "id": f"blk_{i:02d}",
+            "prod_files": 14 if i < 20 else 12,
+            "prod_loc": 1400,
+            "file_coverage_pct": 60.0,
+            "sensitive_sinks": 0,
+            "untested_sinks": 0,
+            "external_libs": [],
+        }
+        for i in range(30)
+    ]
+    # Build a 6-layer linear chain + siblings so layers distribute across 5+ bands.
+    large_edges = [
+        {"u": f"blk_{i:02d}", "v": f"blk_{i + 5:02d}", "n": 2, "violation": False, "reason": ""}
+        for i in range(25)
+    ]
+    large_arch = analyze_architecture(
+        blocks_payload=large_blocks,
+        block_edges=large_edges,
+        packages_payload=[
+            {"id": f"blk_{i:02d}::sub", "block_id": f"blk_{i:02d}"} for i in range(30)
+        ],
+        modules_payload=[],
+        cycles=[],
+        violations=[],
+    )
+    l_prof = large_arch["profile"]
+    assert l_prof["size_tier"] == "large"
+    assert l_prof["recommended_level"] == "blocks"
+    assert l_prof["recommended_density"] == "compact"
+    assert l_prof["max_bands"] >= 5
+    assert l_prof["blast_in_deg_min"] >= 7
