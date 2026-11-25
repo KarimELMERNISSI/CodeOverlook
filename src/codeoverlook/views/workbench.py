@@ -5,6 +5,175 @@ from __future__ import annotations
 import json
 from typing import Any
 
+_WORKBENCH_CSS = """
+  :root {
+    --bg: #F3F8F9; --card: #FFFFFF; --border: #DCE8EB; --fg: #0B2B36;
+    --text: #2F4A56; --muted: #5B7480; --primary: #0E7C86;
+    --primary-strong: #0A646C; --on-primary: #FFFFFF; --soft: #ECF6F7;
+    --accent: #D2EAEC; --ok: #1E7A4D; --warn: #8A5300; --bad: #B42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0D1117; --card: #121C23; --border: #263943; --fg: #E8F2F4;
+      --text: #B9CBD1; --muted: #8CA4AD; --primary: #56C5CE;
+      --primary-strong: #7ADCE3; --on-primary: #06242A; --soft: #131F27;
+      --accent: #11303A; --ok: #5BD08F; --warn: #E5AC5C; --bad: #F2857A;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0D1117; --card: #121C23; --border: #263943; --fg: #E8F2F4;
+    --text: #B9CBD1; --muted: #8CA4AD; --primary: #56C5CE;
+    --primary-strong: #7ADCE3; --on-primary: #06242A; --soft: #131F27;
+    --accent: #11303A; --ok: #5BD08F; --warn: #E5AC5C; --bad: #F2857A;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 18px 22px;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.45;
+  }
+  body.wb-fs-active { overflow: hidden; }
+  h1, strong { color: var(--fg); }
+  h1 { margin: 0; font-size: 21px; font-weight: 700; }
+  .topbar {
+    display: flex; flex-wrap: wrap; justify-content: space-between;
+    align-items: center; gap: 10px; margin-bottom: 14px;
+  }
+  .muted { color: var(--muted); font-size: 12px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px 16px; margin-bottom: 14px;
+  }
+  .source-grid {
+    display: grid;
+    grid-template-columns:
+      minmax(250px, 2.4fr) minmax(120px, 0.9fr) minmax(130px, 0.9fr) auto;
+    gap: 10px; align-items: end;
+  }
+  @media (max-width: 960px) { .source-grid { grid-template-columns: 1fr; } }
+  label.field {
+    display: flex; flex-direction: column; gap: 4px;
+    font-size: 12px; color: var(--muted); font-weight: 600;
+  }
+  input[type="text"], input[type="number"] {
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 13px; width: 100%;
+  }
+  input:focus { outline: none; border-color: var(--primary); }
+  .checks {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    margin-top: 10px; font-size: 13px; color: var(--text);
+  }
+  .checks label {
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  }
+  button, .btn-link {
+    background: var(--primary); color: var(--on-primary);
+    border: 1px solid var(--primary); border-radius: 8px;
+    padding: 8px 14px; font-size: 13px; font-weight: 600;
+    cursor: pointer; text-decoration: none;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  button:hover, .btn-link:hover { filter: brightness(1.06); }
+  button.secondary, .btn-link.secondary {
+    background: var(--bg); border-color: var(--border);
+    color: var(--fg); font-weight: 600;
+  }
+  button.secondary:hover, .btn-link.secondary:hover {
+    border-color: var(--primary);
+  }
+  button.small, .btn-link.small { padding: 5px 10px; font-size: 12px; }
+  button:disabled { opacity: 0.55; cursor: not-allowed; }
+  .layout {
+    display: grid; grid-template-columns: 280px 1fr;
+    gap: 14px; align-items: start;
+  }
+  @media (max-width: 1080px) { .layout { grid-template-columns: 1fr; } }
+  .panel-title {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); margin-bottom: 8px; font-weight: 700;
+  }
+  .cache-item {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 10px; margin-bottom: 8px;
+  }
+  .cache-row {
+    display: flex; justify-content: space-between;
+    align-items: center; gap: 8px;
+  }
+  .status-banner {
+    border-radius: 10px; padding: 10px 14px; margin-bottom: 14px;
+    border: 1px solid var(--border); background: var(--card);
+    display: flex; flex-wrap: wrap; justify-content: space-between;
+    align-items: center; gap: 10px;
+  }
+  .status-banner.error {
+    border-color: var(--bad); background: rgba(180, 35, 24, 0.12);
+    color: var(--bad);
+  }
+  .status-banner.ok { border-color: var(--primary); }
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 700;
+    background: var(--soft); border: 1px solid var(--border); color: var(--fg);
+  }
+  .pill.local { border-color: var(--ok); color: var(--ok); }
+  .pill.online { border-color: var(--primary); color: var(--primary-strong); }
+  .pill.cached { border-color: var(--warn); color: var(--warn); }
+  .tabs-bar {
+    display: flex; flex-wrap: wrap; justify-content: space-between;
+    align-items: center; gap: 8px; margin-bottom: 12px;
+  }
+  .tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+  .tab-btn {
+    background: var(--card); border: 1px solid var(--border);
+    color: var(--muted); font-weight: 600;
+  }
+  .tab-btn.active {
+    background: var(--primary); border-color: var(--primary);
+    color: var(--on-primary);
+  }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+  .explorer-shell { position: relative; }
+  .explorer-shell.fs-frame {
+    position: fixed; inset: 0; z-index: 9999; background: var(--bg);
+    padding: 0; margin: 0; width: 100vw; height: 100vh;
+  }
+  .fs-exit-bar {
+    display: none; position: fixed; top: 10px; right: 14px; z-index: 10000;
+  }
+  .explorer-shell.fs-frame .fs-exit-bar { display: block; }
+  iframe#explorer-frame {
+    width: 100%; height: 800px; border: 1px solid var(--border);
+    border-radius: 10px; background: var(--bg); display: block;
+  }
+  .explorer-shell.fs-frame iframe#explorer-frame {
+    height: 100vh; border: 0; border-radius: 0;
+  }
+  pre.code-box {
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+    overflow: auto; max-height: 520px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px; white-space: pre-wrap; word-break: break-word;
+  }
+  .slice-form {
+    display: grid; grid-template-columns: 2fr 120px 100px auto;
+    gap: 10px; align-items: end; margin-bottom: 12px;
+  }
+  @media (max-width: 820px) { .slice-form { grid-template-columns: 1fr; } }
+  .list-card {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; font-size: 13px;
+  }
+  code {
+    background: var(--soft); color: var(--primary-strong);
+    padding: 1px 5px; border-radius: 4px; font-size: 12px;
+  }
+"""
+
 
 def _safe_json_for_script(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
@@ -36,244 +205,7 @@ def render_workbench_html(
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>CodeOverlook Workbench</title>
-<style>
-  :root {{
-    --bg: #0f172a;
-    --surface: #1e293b;
-    --surface-2: #263348;
-    --border: #334155;
-    --text: #f1f5f9;
-    --muted: #94a3b8;
-    --accent: #38bdf8;
-    --accent-dark: #0284c7;
-    --ok: #16a34a;
-    --warn: #ca8a04;
-    --err: #dc2626;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0;
-    padding: 18px 22px;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    font-size: 14px;
-    line-height: 1.45;
-  }}
-  h1 {{ margin: 0; font-size: 20px; font-weight: 600; }}
-  .topbar {{
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 14px;
-  }}
-  .muted {{ color: var(--muted); font-size: 12px; }}
-  .card {{
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 14px;
-    margin-bottom: 14px;
-  }}
-  .source-grid {{
-    display: grid;
-    grid-template-columns: minmax(260px, 2.4fr) minmax(120px, 0.9fr) minmax(130px, 0.9fr) auto;
-    gap: 10px;
-    align-items: end;
-  }}
-  @media (max-width: 960px) {{
-    .source-grid {{ grid-template-columns: 1fr; }}
-  }}
-  label.field {{
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    font-size: 12px;
-    color: var(--muted);
-  }}
-  input[type="text"], input[type="number"] {{
-    background: var(--bg);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px 10px;
-    font-size: 13px;
-    width: 100%;
-  }}
-  input:focus {{
-    outline: none;
-    border-color: var(--accent);
-  }}
-  .checks {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 16px;
-    margin-top: 10px;
-    font-size: 13px;
-    color: var(--text);
-  }}
-  .checks label {{
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-  }}
-  button, .btn-link {{
-    background: var(--accent-dark);
-    color: #f8fafc;
-    border: 1px solid var(--accent);
-    border-radius: 6px;
-    padding: 8px 14px;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    text-decoration: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-  }}
-  button:hover, .btn-link:hover {{ filter: brightness(1.1); }}
-  button.secondary {{
-    background: var(--surface-2);
-    border-color: var(--border);
-    color: var(--text);
-    font-weight: 500;
-  }}
-  button.small {{
-    padding: 5px 10px;
-    font-size: 12px;
-  }}
-  button:disabled {{
-    opacity: 0.55;
-    cursor: not-allowed;
-  }}
-  .layout {{
-    display: grid;
-    grid-template-columns: 290px 1fr;
-    gap: 14px;
-    align-items: start;
-  }}
-  @media (max-width: 1080px) {{
-    .layout {{ grid-template-columns: 1fr; }}
-  }}
-  .panel-title {{
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--muted);
-    margin-bottom: 8px;
-    font-weight: 600;
-  }}
-  .cache-item {{
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: 7px;
-    padding: 9px 10px;
-    margin-bottom: 8px;
-  }}
-  .cache-row {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-  }}
-  .status-banner {{
-    border-radius: 8px;
-    padding: 10px 14px;
-    margin-bottom: 12px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    align-items: center;
-    gap: 10px;
-  }}
-  .status-banner.error {{
-    border-color: var(--err);
-    background: rgba(220, 38, 38, 0.14);
-    color: #fecaca;
-  }}
-  .status-banner.ok {{
-    border-color: #1d4ed8;
-  }}
-  .pill {{
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 999px;
-    font-size: 11px;
-    font-weight: 700;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-  }}
-  .pill.local {{ border-color: var(--ok); color: #86efac; }}
-  .pill.online {{ border-color: var(--accent); color: #bae6fd; }}
-  .pill.cached {{ border-color: var(--warn); color: #fde68a; }}
-  .tabs {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-bottom: 12px;
-  }}
-  .tab-btn {{
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--muted);
-    font-weight: 600;
-  }}
-  .tab-btn.active {{
-    background: var(--accent-dark);
-    border-color: var(--accent);
-    color: #ffffff;
-  }}
-  .tab-pane {{ display: none; }}
-  .tab-pane.active {{ display: block; }}
-  iframe#explorer-frame {{
-    width: 100%;
-    height: 760px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--bg);
-  }}
-  pre.code-box {{
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px;
-    overflow: auto;
-    max-height: 520px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 12.5px;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }}
-  .slice-form {{
-    display: grid;
-    grid-template-columns: 2fr 120px 100px auto;
-    gap: 10px;
-    align-items: end;
-    margin-bottom: 12px;
-  }}
-  @media (max-width: 820px) {{
-    .slice-form {{ grid-template-columns: 1fr; }}
-  }}
-  .list-card {{
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: 7px;
-    padding: 8px 10px;
-    margin-bottom: 8px;
-    font-size: 13px;
-  }}
-  code {{
-    background: rgba(15, 23, 42, 0.7);
-    padding: 1px 5px;
-    border-radius: 4px;
-    font-size: 12px;
-  }}
-</style>
+<style>{_WORKBENCH_CSS}</style>
 </head>
 <body>
   <div class="topbar">
@@ -284,7 +216,10 @@ def render_workbench_html(
         offline reuse.
       </div>
     </div>
-    <div id="cache-root-label" class="muted"></div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <div id="cache-root-label" class="muted"></div>
+      <button id="wb-theme-btn" type="button" class="secondary small">Theme: system</button>
+    </div>
   </div>
 
   <div class="card">
@@ -343,22 +278,33 @@ def render_workbench_html(
     </aside>
 
     <main>
-      <div class="tabs">
-        <button type="button" class="tab-btn active" data-tab="explorer"
-                onclick="switchTab('explorer')">Explorer</button>
-        <button type="button" class="tab-btn" data-tab="slicer"
-                onclick="switchTab('slicer')">Context Slicer</button>
-        <button type="button" class="tab-btn" data-tab="mermaid"
-                onclick="switchTab('mermaid')">Mermaid</button>
-        <button type="button" class="tab-btn" data-tab="risks"
-                onclick="switchTab('risks')">Risks &amp; Cycles</button>
+      <div class="tabs-bar">
+        <div class="tabs">
+          <button type="button" class="tab-btn active" data-tab="explorer"
+                  onclick="switchTab('explorer')">Explorer</button>
+          <button type="button" class="tab-btn" data-tab="slicer"
+                  onclick="switchTab('slicer')">Context Slicer</button>
+          <button type="button" class="tab-btn" data-tab="mermaid"
+                  onclick="switchTab('mermaid')">Mermaid</button>
+          <button type="button" class="tab-btn" data-tab="risks"
+                  onclick="switchTab('risks')">Risks &amp; Cycles</button>
+        </div>
+        <button type="button" id="wb-fs-btn" class="secondary small"
+                onclick="toggleExplorerFullscreen()">Full Screen Explorer</button>
       </div>
 
       <section id="tab-explorer" class="tab-pane active">
         <div id="explorer-empty" class="card muted">
           No active inspection session yet.
         </div>
-        <iframe id="explorer-frame" style="display:none;" title="CodeOverlook Explorer"></iframe>
+        <div id="explorer-shell" class="explorer-shell" style="display:none;">
+          <div class="fs-exit-bar">
+            <button type="button" class="small" onclick="toggleExplorerFullscreen(false)">
+              Exit Full Screen (Esc)
+            </button>
+          </div>
+          <iframe id="explorer-frame" allowfullscreen title="CodeOverlook Explorer"></iframe>
+        </div>
       </section>
 
       <section id="tab-slicer" class="tab-pane">
@@ -423,12 +369,35 @@ Run an inspection to generate Mermaid diagrams.</pre>
 const BOOT = {boot_config};
 let activeSession = null;
 let mermaidMode = 'arch';
+let wbFullscreen = false;
+const WB_THEMES = ['system', 'light', 'dark'];
+let wbTheme = 'system';
 
 function esc(value) {{
   return String(value).replace(/[&<>"']/g, c => ({{
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }}[c]));
 }}
+
+document.getElementById('wb-theme-btn').addEventListener('click', () => {{
+  wbTheme = WB_THEMES[(WB_THEMES.indexOf(wbTheme) + 1) % WB_THEMES.length];
+  if (wbTheme === 'system') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', wbTheme);
+  document.getElementById('wb-theme-btn').textContent = 'Theme: ' + wbTheme;
+}});
+
+function toggleExplorerFullscreen(forceState) {{
+  if (!activeSession) return;
+  const next = typeof forceState === 'boolean' ? forceState : !wbFullscreen;
+  wbFullscreen = next;
+  if (next) switchTab('explorer');
+  document.body.classList.toggle('wb-fs-active', next);
+  document.getElementById('explorer-shell').classList.toggle('fs-frame', next);
+}}
+
+document.addEventListener('keydown', ev => {{
+  if (ev.key === 'Escape' && wbFullscreen) toggleExplorerFullscreen(false);
+}});
 
 function switchTab(tabId) {{
   document.querySelectorAll('.tab-btn').forEach(btn => {{
@@ -543,10 +512,9 @@ async function runInspect() {{
       `<a class="btn-link secondary small" href="${{esc(data.report_url)}}?download=1">`
       + `Export Standalone HTML</a>`;
 
-    const frame = document.getElementById('explorer-frame');
     document.getElementById('explorer-empty').style.display = 'none';
-    frame.style.display = 'block';
-    frame.src = data.report_url;
+    document.getElementById('explorer-shell').style.display = 'block';
+    document.getElementById('explorer-frame').src = data.report_url;
 
     renderMermaid();
     renderRisks(data.cycles, data.violations);
