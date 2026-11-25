@@ -1,0 +1,16 @@
+.codeoverlook/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+.claude/
+.agents/
