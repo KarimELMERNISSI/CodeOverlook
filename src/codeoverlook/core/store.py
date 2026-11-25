@@ -738,6 +738,20 @@ class FactStore:
                     prod_symbols[src_raw]["degree"] += 1
                     prod_symbols[dst_raw]["degree"] += 1
 
+        prod_count = len(prod_files)
+        if prod_count <= 40:
+            mod_limit, blk_limit, cross_limit, findings_limit = 32, 64, 800, 400
+            max_packed_modules = prod_count
+        elif prod_count <= 250:
+            mod_limit, blk_limit, cross_limit, findings_limit = 20, 44, 700, 350
+            max_packed_modules = prod_count
+        elif prod_count <= 800:
+            mod_limit, blk_limit, cross_limit, findings_limit = 14, 36, 600, 300
+            max_packed_modules = prod_count
+        else:
+            mod_limit, blk_limit, cross_limit, findings_limit = 8, 28, 500, 300
+            max_packed_modules = 600
+
         mod_findings: dict[str, list[dict[str, Any]]] = defaultdict(list)
         all_findings: list[dict[str, Any]] = []
         for row in self.conn.execute(
@@ -774,7 +788,7 @@ class FactStore:
             }
             if len(mod_findings[fp]) < 15:
                 mod_findings[fp].append(item)
-            if len(all_findings) < 300:
+            if len(all_findings) < findings_limit:
                 all_findings.append(item)
 
         def _pack_symbol_subgraph(
@@ -799,13 +813,17 @@ class FactStore:
                 "total_symbols": len(candidate_ids),
             }
 
+        ranked_mod_paths = sorted(
+            (fp for fp, sids in symbols_by_file.items() if sids),
+            key=lambda fp: (-symbol_counts.get(fp, 0), -prod_files[fp][1], fp),
+        )[:max_packed_modules]
+
         by_module_graph = {
-            fp: _pack_symbol_subgraph(sids, 16)
-            for fp, sids in symbols_by_file.items()
-            if sids
+            fp: _pack_symbol_subgraph(symbols_by_file[fp], mod_limit)
+            for fp in ranked_mod_paths
         }
         by_block_graph = {
-            blk: _pack_symbol_subgraph(sids, 36)
+            blk: _pack_symbol_subgraph(sids, blk_limit)
             for blk, sids in symbols_by_block.items()
             if sids
         }
@@ -822,7 +840,7 @@ class FactStore:
                 and v in kept_mod_sym_ids
                 and self._file_from_node(u) != self._file_from_node(v)
             )
-        ][:600]
+        ][:cross_limit]
 
         modules: list[dict[str, Any]] = []
         for path, (block_id, loc) in prod_files.items():
@@ -851,6 +869,12 @@ class FactStore:
                 "by_module": by_module_graph,
                 "by_block": by_block_graph,
                 "cross_edges": cross_edges,
+                "budget": {
+                    "prod_files": prod_count,
+                    "mod_symbol_cap": mod_limit,
+                    "block_symbol_cap": blk_limit,
+                    "cross_edge_cap": cross_limit,
+                },
             },
         }
 

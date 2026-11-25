@@ -35,6 +35,14 @@ _INTERFACE_LIBS: frozenset[str] = frozenset(
         "tornado",
         "aiohttp",
         "starlette",
+        "uvicorn",
+        "gunicorn",
+        "grpc",
+        "rich",
+        "curses",
+        "tkinter",
+        "pyqt5",
+        "pyside6",
     }
 )
 
@@ -44,21 +52,25 @@ _CONNECTOR_LIBS: frozenset[str] = frozenset(
         "duckdb",
         "psycopg",
         "psycopg2",
+        "asyncpg",
         "pymongo",
+        "motor",
         "redis",
         "requests",
         "httpx",
         "urllib3",
-        "openai",
-        "anthropic",
-        "langchain_core",
-        "langchain",
-        "qdrant_client",
-        "chromadb",
+        "aiohttp",
+        "celery",
+        "kafka",
+        "pika",
         "boto3",
+        "google",
+        "azure",
         "sqlite3",
         "aiofiles",
-        "mistralai",
+        "paramiko",
+        "ftplib",
+        "smtplib",
     }
 )
 
@@ -75,6 +87,12 @@ _ENGINE_LIBS: frozenset[str] = frozenset(
         "matplotlib",
         "polars",
         "pyarrow",
+        "sympy",
+        "networkx",
+        "cv2",
+        "pil",
+        "pydantic",
+        "attrs",
     }
 )
 
@@ -139,17 +157,18 @@ def infer_block_role(
     conn_hits = len(lib_set & _CONNECTOR_LIBS)
     eng_hits = len(lib_set & _ENGINE_LIBS)
 
+    foundation_min_in = max(2, 3) if out_deg <= 2 else 3
     if in_deg == 0 and out_deg > 0:
         role = "interface"
+    elif (in_deg >= foundation_min_in and instability <= 0.35 and out_deg <= 2) or (
+        out_deg == 0 and in_deg > 0 and eng_hits == 0
+    ):
+        role = "foundation"
     elif (
         (iface_hits > 0 or any(tok in lower_id for tok in ("ui", "page", "cli", "web", "app")))
         and in_deg <= 2
     ):
         role = "interface"
-    elif (in_deg >= 3 and instability <= 0.35 and out_deg <= 2) or (
-        out_deg == 0 and in_deg > 0 and eng_hits == 0
-    ):
-        role = "foundation"
     elif eng_hits > conn_hits and eng_hits > 0:
         role = "engine"
     elif conn_hits > 0 or sinks >= 3:
@@ -276,22 +295,34 @@ def compute_layered_architecture(
         tier_offset = 1 if role in {"engine", "foundation"} and max_depth > 0 else 0
         raw_rank[b] = base * 2 + caller_offset + tier_offset
 
+    prod_count = len(prod_blocks)
     distinct = sorted(set(raw_rank.values()))
-    if len(distinct) <= 4:
+    if prod_count <= 4:
+        max_bands = max(1, min(3, len(distinct)))
+    elif prod_count <= 18:
+        max_bands = 4
+    elif prod_count <= 36:
+        max_bands = 5
+    else:
+        max_bands = 6
+
+    if len(distinct) <= max_bands:
         tier_map = {val: f"L{idx + 1}" for idx, val in enumerate(distinct)}
     elif distinct[0] == 0:
         # Keep zero-caller interface entrypoints (`raw_rank == 0`) in L1,
-        # and distribute downstream tiers across L2..L4.
+        # and distribute downstream tiers across L2..L{max_bands}.
         rest_min, rest_max = distinct[1], distinct[-1]
         rest_span = max(1, rest_max - rest_min)
         tier_map = {0: "L1"}
+        down_levels = max(1, max_bands - 2)
         for val in distinct[1:]:
-            tier_map[val] = f"L{min(4, 2 + ((val - rest_min) * 2) // rest_span)}"
+            band_num_val = 2 + ((val - rest_min) * down_levels) // rest_span
+            tier_map[val] = f"L{min(max_bands, band_num_val)}"
     else:
         min_r, max_r = distinct[0], distinct[-1]
         span = max(1, max_r - min_r)
         tier_map = {
-            val: f"L{min(4, 1 + ((val - min_r) * 3) // span)}"
+            val: f"L{min(max_bands, 1 + ((val - min_r) * (max_bands - 1)) // span)}"
             for val in distinct
         }
 
@@ -466,6 +497,102 @@ def discover_features(
     return features
 
 
+def _percentile_int(values: list[int], pct: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(math.floor((len(ordered) - 1) * pct))))
+    return ordered[idx]
+
+
+def compute_project_profile(
+    *,
+    prod_blocks: list[str],
+    block_map: dict[str, dict[str, Any]],
+    packages_count: int,
+    modules_payload: list[dict[str, Any]],
+    zones: dict[str, Literal["production", "tooling"]],
+    bands_count: int,
+) -> dict[str, Any]:
+    """Classify repository scale and derive adaptive thresholds and UI defaults."""
+    prod_blocks_count = len(prod_blocks)
+    total_prod_files = sum(int(block_map[b].get("prod_files", 0)) for b in prod_blocks)
+    if total_prod_files == 0 and modules_payload:
+        total_prod_files = sum(
+            1
+            for m in modules_payload
+            if zones.get(str(m.get("block_id")), "production") != "tooling"
+        )
+    total_prod_loc = sum(int(block_map[b].get("prod_loc", 0)) for b in prod_blocks)
+
+    if total_prod_files <= 12:
+        size_tier = "micro"
+    elif total_prod_files <= 50:
+        size_tier = "small"
+    elif total_prod_files <= 250:
+        size_tier = "medium"
+    elif total_prod_files <= 1000:
+        size_tier = "large"
+    else:
+        size_tier = "enterprise"
+
+    if prod_blocks_count <= 1 and total_prod_files <= 24:
+        recommended_level = "modules"
+    elif prod_blocks_count <= 1 and packages_count >= 2:
+        recommended_level = "packages"
+    else:
+        recommended_level = "blocks"
+
+    if size_tier in {"micro", "small"} and prod_blocks_count <= 10:
+        recommended_density = "spacious"
+    elif size_tier in {"large", "enterprise"} or prod_blocks_count >= 24:
+        recommended_density = "compact"
+    else:
+        recommended_density = "balanced"
+
+    blast_in_deg_min = max(2, min(8, int(math.ceil(max(1, prod_blocks_count) * 0.25))))
+
+    prod_mods = [
+        m
+        for m in modules_payload
+        if zones.get(str(m.get("block_id")), "production") != "tooling"
+    ]
+    if len(prod_mods) >= 8:
+        locs = [int(m.get("loc", 0)) for m in prod_mods]
+        degs = [len(m.get("imports", [])) + len(m.get("imported_by", [])) for m in prod_mods]
+        god_loc_min = max(350, min(600, _percentile_int(locs, 0.90)))
+        god_deg_min = max(4, min(10, _percentile_int(degs, 0.90)))
+    else:
+        god_loc_min = 450
+        god_deg_min = 5
+
+    max_bands = (
+        max(1, min(3, bands_count))
+        if prod_blocks_count <= 4
+        else 4
+        if prod_blocks_count <= 18
+        else 5
+        if prod_blocks_count <= 36
+        else 6
+    )
+
+    tier_title = size_tier.capitalize()
+    size_label = f"{tier_title} ({total_prod_files:,} files)"
+    return {
+        "size_tier": size_tier,
+        "size_label": size_label,
+        "prod_blocks_count": prod_blocks_count,
+        "prod_files_count": total_prod_files,
+        "prod_loc": total_prod_loc,
+        "recommended_level": recommended_level,
+        "recommended_density": recommended_density,
+        "max_bands": max(bands_count, max_bands),
+        "blast_in_deg_min": blast_in_deg_min,
+        "god_loc_min": god_loc_min,
+        "god_deg_min": god_deg_min,
+    }
+
+
 def analyze_architecture(
     *,
     blocks_payload: list[dict[str, Any]],
@@ -552,7 +679,19 @@ def analyze_architecture(
     for bid in tooling_blocks:
         band_of[bid] = "TOOLING"
 
-    # 4. Count per-block cycle/back-edge exposure and detect God modules.
+    # 4. Compute repository profile, cycle/back-edge exposure, and adaptive weaknesses.
+    profile = compute_project_profile(
+        prod_blocks=prod_blocks,
+        block_map=block_map,
+        packages_count=len(packages_payload),
+        modules_payload=modules_payload,
+        zones=zones,
+        bands_count=len(bands_meta),
+    )
+    blast_in_deg_min = int(profile["blast_in_deg_min"])
+    god_loc_min = int(profile["god_loc_min"])
+    god_deg_min = int(profile["god_deg_min"])
+
     cycle_block_counts: dict[str, int] = defaultdict(int)
     mod_to_block = {str(m["path"]): str(m["block_id"]) for m in modules_payload}
     for cyc in cycles:
@@ -573,7 +712,7 @@ def analyze_architecture(
             continue
         loc = int(m.get("loc", 0))
         degree = len(m.get("imports", [])) + len(m.get("imported_by", []))
-        if loc >= 450 and degree >= 5:
+        if loc >= god_loc_min and degree >= god_deg_min:
             god_blocks.add(bid)
             god_modules.append(
                 {
@@ -588,7 +727,7 @@ def analyze_architecture(
                 }
             )
     god_modules.sort(key=lambda item: (-item["score"], item["path"]))
-    god_modules = god_modules[:8]
+    god_modules = god_modules[:10]
 
     block_metrics: dict[str, dict[str, Any]] = {}
     for bid in all_ids:
@@ -604,7 +743,7 @@ def analyze_architecture(
             tags.append("CYCLE")
         if back_edge_counts.get(bid, 0) > 0:
             tags.append("BACK-EDGE")
-        if ca >= 4 and cov_pct < 75.0:
+        if ca >= blast_in_deg_min and cov_pct < 75.0:
             tags.append("HIGH BLAST RADIUS")
         if untested_sinks > 0:
             tags.append("UNTESTED SINKS")
@@ -739,4 +878,5 @@ def analyze_architecture(
         "features": features,
         "god_modules": god_modules,
         "diagnosis": diagnosis[:5],
+        "profile": profile,
     }

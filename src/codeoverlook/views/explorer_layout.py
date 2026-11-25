@@ -80,6 +80,7 @@ def build_explorer_model(
     symbol_graph.setdefault("by_module", {})
     symbol_graph.setdefault("by_block", {})
     symbol_graph.setdefault("cross_edges", [])
+    symbol_graph.setdefault("budget", {})
 
     modules_by_block: dict[str, list[dict[str, Any]]] = defaultdict(list)
     modules_by_pkg: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -335,6 +336,7 @@ def build_explorer_model(
         "features": arch["features"],
         "diagnosis": arch["diagnosis"],
         "god_modules": arch["god_modules"],
+        "profile": arch.get("profile", {}),
         "symbol_graph": symbol_graph,
         "cycles": cycles[:30],
         "violations": violations,
