@@ -1,0 +1,19 @@
+[scan]
+exclude = ["ignored_pkg/**", "**/migrations/**"]
+
+[blocks.ui]
+description = "Interface utilisateur"
+patterns = ["ui/**"]
+
+[blocks.engine]
+description = "Moteur analytique"
+patterns = ["engine/**"]
+
+[blocks.storage]
+description = "Persistance et archives"
+patterns = ["storage/**"]
+
+[[architecture.forbid]]
+from = "ui"
+to = "storage"
+reason = "L'UI doit passer par engine et ne pas importer storage directement."
