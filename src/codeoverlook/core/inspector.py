@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,8 +16,44 @@ from codeoverlook.core.coverage import RepoCoverageReport, TestCoverageAnalyzer
 from codeoverlook.core.slicer import ContextSlicer, SliceResult
 from codeoverlook.core.sources import ResolvedTarget, TargetResolver
 from codeoverlook.core.store import FactStore, FileParseResult
-from codeoverlook.ingesters.python_ast import PythonASTIngester
+from codeoverlook.ingesters.python_ast import DEFAULT_EXCLUDED_DIRS, PythonASTIngester
 from codeoverlook.views.html_renderer import render_atlas_html
+
+_NON_PYTHON_SOURCE_EXTS: frozenset[str] = frozenset(
+    {
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".java",
+        ".go",
+        ".rs",
+        ".c",
+        ".h",
+        ".cpp",
+        ".hpp",
+        ".cs",
+        ".rb",
+        ".php",
+        ".swift",
+        ".kt",
+        ".scala",
+    }
+)
+
+
+def _detect_source_extensions(repo_root: Path, limit: int = 4) -> list[tuple[str, int]]:
+    """Count common non-Python source file extensions present under `repo_root`."""
+    counts: Counter[str] = Counter()
+    for _root, dirnames, filenames in os.walk(repo_root):
+        dirnames[:] = [d for d in dirnames if d not in DEFAULT_EXCLUDED_DIRS]
+        for fname in filenames:
+            ext = Path(fname).suffix.lower()
+            if ext in _NON_PYTHON_SOURCE_EXTS:
+                counts[ext] += 1
+    return counts.most_common(limit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +163,24 @@ def scan_repository(
         progress_callback,
         ProgressEvent("discovering", 22, f"Found {total_files} Python files", 0, total_files),
     )
+
+    if total_files == 0:
+        detected = _detect_source_extensions(repo_root)
+        if detected:
+            detected_str = ", ".join(f"{ext} ({cnt})" for ext, cnt in detected)
+            empty_msg = (
+                f"No Python (.py) files found in '{target.display_name}' "
+                f"(detected: {detected_str}). "
+                "For now, CodeOverlook only supports Python repositories."
+            )
+        else:
+            empty_msg = (
+                f"No Python (.py) files found in '{target.display_name}'. "
+                "For now, CodeOverlook only supports Python repositories."
+            )
+        warnings.append(empty_msg)
+        if warning_handler:
+            warning_handler(empty_msg)
 
     skipped = 0
     active_paths: list[str] = []

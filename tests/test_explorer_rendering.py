@@ -379,3 +379,21 @@ def test_explorer_js_has_no_duplicate_scope_declarations() -> None:
         for fn, decls in fn_decls.items()
     }
     assert {fn: names for fn, names in dups.items() if names} == {}
+
+
+def test_non_python_repo_emits_python_only_notice(tmp_path: Path) -> None:
+    """Emit clear Python-only guidance when scanning a non-Python repository."""
+    from codeoverlook.core.inspector import inspect_target
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "index.ts").write_text("export const x = 1;\n", encoding="utf-8")
+    (tmp_path / "src" / "App.tsx").write_text("export function App() {}\n", encoding="utf-8")
+
+    _, scan_summary, snapshot = inspect_target(str(tmp_path))
+    assert scan_summary.indexed_files == 0
+    assert any("only supports Python" in w and ".ts" in w for w in scan_summary.warnings)
+    assert "only supports Python" in snapshot.html_doc
+
+    wb_html = render_workbench_html()
+    assert "only supports Python" in wb_html
+    assert "Python repositories only for now" in wb_html

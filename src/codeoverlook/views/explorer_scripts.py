@@ -1017,11 +1017,22 @@ function renderCapBanner(label, totalCount, includeTableBtn) {
   });
 }
 
+function emptyPythonNoticeHtml() {
+  return `<div style="padding:24px;">`
+    + `<div class="subcard">`
+    + `<strong>No Python (.py) files found in this repository.</strong>`
+    + `<div class="muted" style="margin-top:4px;">`
+    + `For now, CodeOverlook only supports Python projects.`
+    + `</div></div></div>`;
+}
+
 function renderSvgView(fitOnRender) {
   let { nodes, edges, nodeMap } = activeNodesAndEdges();
   if (!nodes.length) {
     renderScopeBanner("");
-    $("viewport-canvas").innerHTML = `<div class="muted" style="padding:20px;">No nodes.</div>`;
+    $("viewport-canvas").innerHTML = !DATA.blocks.length
+      ? emptyPythonNoticeHtml()
+      : `<div class="muted" style="padding:20px;">No nodes.</div>`;
     renderMinimap(null, 0);
     return;
   }
@@ -1345,8 +1356,9 @@ function renderModulesSvg(fitOnRender) {
   const allRows = getFilteredModules();
   if (!allRows.length) {
     renderScopeBanner("");
-    $("viewport-canvas").innerHTML =
-      `<div class="muted" style="padding:20px;">No matching modules.</div>`;
+    $("viewport-canvas").innerHTML = !DATA.modules.length
+      ? emptyPythonNoticeHtml()
+      : `<div class="muted" style="padding:20px;">No matching modules.</div>`;
     renderMinimap(null, 0);
     return;
   }
@@ -1851,7 +1863,9 @@ function renderCardsView() {
   renderScopeBanner("");
   const { nodes, nodeMap } = activeNodesAndEdges();
   if (!nodes.length) {
-    $("cards-arch").innerHTML = `<div class="muted">No items to display.</div>`;
+    $("cards-arch").innerHTML = !DATA.blocks.length
+      ? emptyPythonNoticeHtml()
+      : `<div class="muted">No items to display.</div>`;
     return;
   }
   const chosen = picked[level] || nodes[0].id;

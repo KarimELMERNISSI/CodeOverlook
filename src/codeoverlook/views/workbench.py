@@ -112,6 +112,10 @@ _WORKBENCH_CSS = """
     border-color: var(--bad); background: rgba(180, 35, 24, 0.12);
     color: var(--bad);
   }
+  .status-banner.warn {
+    border-color: var(--warn); background: rgba(138, 83, 0, 0.12);
+    color: var(--fg);
+  }
   .status-banner.ok { border-color: var(--primary); }
   .progress-wrap {
     flex-basis: 100%; margin-top: 4px; padding-top: 8px;
@@ -243,7 +247,7 @@ def render_workbench_html(
       <h1>CodeOverlook Inspection Workbench</h1>
       <div class="muted">
         Inspect local Python repositories offline or fetch &amp; cache GitHub projects for
-        offline reuse.
+        offline reuse. (Python repositories only for now)
       </div>
     </div>
     <div style="display:flex;align-items:center;gap:10px;">
@@ -540,6 +544,14 @@ function applyInspectResult(data) {{
     modeLabel = t.from_cache ? 'GITHUB (CACHED OFFLINE)' : 'GITHUB (ONLINE FETCH)';
   }}
 
+  const emptyRepo = s.indexed_files === 0 && s.skipped_files === 0 && cov.blocks_count === 0;
+  const pyWarn = (s.warnings || []).find(w => w.includes('Python'))
+    || 'No Python (.py) files found. For now, CodeOverlook only supports Python repositories.';
+  const warnHtml = emptyRepo
+    ? `<div style="flex-basis:100%;margin-top:4px;font-weight:600;color:var(--warn);">`
+      + `${{esc(pyWarn)}}</div>`
+    : '';
+
   setStatus(
     `<span class="pill ${{pillClass}}">${{modeLabel}}</span> `
     + `<strong>${{esc(t.display_name)}}</strong> `
@@ -548,8 +560,9 @@ function applyInspectResult(data) {{
     + `${{s.pruned_files}} pruned | `
     + `${{cov.blocks_count}} blocks | `
     + `${{cov.linked_test_files}}/${{cov.total_test_files}} test files | `
-    + `${{data.cycles.length}} cycles | ${{data.violations.length}} violations)</span>`,
-    'ok'
+    + `${{data.cycles.length}} cycles | ${{data.violations.length}} violations)</span>`
+    + warnHtml,
+    emptyRepo ? 'warn' : 'ok'
   );
 
   document.getElementById('status-actions').innerHTML =
