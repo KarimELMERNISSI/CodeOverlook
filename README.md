@@ -1,6 +1,6 @@
 # CodeOverlook
 
-Panoramic visual code map, deterministic architectural boundary inspector, test-gap radar, and token-budgeted Context Slicer for Python (`>= 3.11`).
+Panoramic visual code map, deterministic architectural boundary inspector, test-gap radar, and token-budgeted Context Slicer for Python (`>= 3.12`).
 
 ## Why CodeOverlook
 

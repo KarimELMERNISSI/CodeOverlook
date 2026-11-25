@@ -7,7 +7,7 @@ name = "codeoverlook"
 version = "0.1.0"
 description = "Panoramic visual code map, architectural boundary inspector, test-gap radar, and Context Slicer for Python"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = []
 
 [project.scripts]
@@ -29,7 +29,7 @@ pythonpath = ["src"]
 addopts = "-q"
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
 
