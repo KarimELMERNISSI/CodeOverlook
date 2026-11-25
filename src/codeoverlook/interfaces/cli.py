@@ -3,136 +3,126 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sqlite3
 import sys
-import time
 from dataclasses import asdict
 from pathlib import Path
 
 from codeoverlook.core.blocks import BlockResolver
 from codeoverlook.core.coverage import TestCoverageAnalyzer
-from codeoverlook.core.slicer import ContextSlicer
-from codeoverlook.core.store import FactStore, FileParseResult
-from codeoverlook.ingesters.python_ast import PythonASTIngester
+from codeoverlook.core.inspector import (
+    get_db_path,
+    scan_repository,
+    slice_repository_target,
+)
+from codeoverlook.core.sources import ResolvedTarget, SourceResolutionError, TargetResolver
+from codeoverlook.core.store import FactStore
+from codeoverlook.interfaces.web_server import serve_workbench
 from codeoverlook.views.html_renderer import render_atlas_html
 from codeoverlook.views.mermaid import render_block_mermaid, render_coverage_mermaid
 
 
-def _get_db_path(repo_root: Path) -> Path:
-    return repo_root.resolve() / ".codeoverlook" / "index.db"
-
-
-def _validate_repo_dir(repo_arg: str) -> Path | None:
-    repo_root = Path(repo_arg).resolve()
-    if not repo_root.exists() or not repo_root.is_dir():
-        print(
-            f"Error: repository path '{repo_root}' does not exist or is not a directory.",
-            file=sys.stderr,
+def _resolve_target_from_args(args: argparse.Namespace) -> ResolvedTarget | None:
+    cache_dir = Path(args.cache_dir) if getattr(args, "cache_dir", None) else None
+    resolver = TargetResolver(cache_dir=cache_dir)
+    try:
+        return resolver.resolve(
+            args.repo,
+            ref=getattr(args, "ref", None),
+            subpath=getattr(args, "subpath", None),
+            offline=bool(getattr(args, "offline", False)),
+            refresh=bool(getattr(args, "refresh", False)),
         )
+    except SourceResolutionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return None
-    return repo_root
 
 
-def _require_existing_db(repo_root: Path) -> Path | None:
-    db_path = _get_db_path(repo_root)
+def _require_existing_db(target: ResolvedTarget) -> Path | None:
+    db_path = get_db_path(target.root_path)
     if not db_path.exists():
         print(
             f"Error: no index found at '{db_path}'. "
-            f"Run `codeoverlook scan {repo_root}` first.",
+            f"Run `codeoverlook scan {target.original_target}` first.",
             file=sys.stderr,
         )
         return None
     return db_path
 
 
+def _add_source_args(parser: argparse.ArgumentParser, *, include_refresh: bool = False) -> None:
+    parser.add_argument(
+        "--ref",
+        default=None,
+        help="Git branch, tag, or commit SHA when inspecting a GitHub target",
+    )
+    parser.add_argument(
+        "--subpath",
+        default=None,
+        help="Optional subdirectory relative to the repository root",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Offline mode: inspect local folders or previously cached GitHub repos only",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Override persistent cache directory (defaults to ~/.codeoverlook/cache)",
+    )
+    if include_refresh:
+        parser.add_argument(
+            "--refresh",
+            action="store_true",
+            help="Re-fetch a cached GitHub repository from upstream before running",
+        )
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
-    """Index (or incrementally update) a Python repository into `.codeoverlook/index.db`.
-
-    Args:
-        args: Parsed CLI arguments containing `repo` and `force`.
-
-    Returns:
-        Exit code (`0` on success, `1` on error).
-    """
-    repo_root = _validate_repo_dir(args.repo)
-    if repo_root is None:
+    """Index (or incrementally update) a local or GitHub Python repository."""
+    target = _resolve_target_from_args(args)
+    if target is None:
         return 1
 
-    db_path = _get_db_path(repo_root)
-    t0 = time.perf_counter()
-
-    resolver = BlockResolver(repo_root)
-    for warning in resolver.config.warnings:
-        print(f"Warning: {warning}", file=sys.stderr)
-
-    ingester = PythonASTIngester(
-        repo_root,
-        block_resolver=resolver.resolve,
-        exclude_checker=resolver.is_excluded,
-        test_detector=resolver.is_test_file,
+    summary = scan_repository(
+        target,
+        force=bool(args.force),
+        warning_handler=lambda msg: print(f"Warning: {msg}", file=sys.stderr),
     )
+    coverage = summary.coverage
+    assert coverage is not None
 
-    skipped = 0
-    active_paths: list[str] = []
-    parsed_batch: list[FileParseResult] = []
+    if target.source_kind == "github":
+        mode = "cached offline" if target.from_cache else (target.fetch_method or "online")
+        print(f"Source: GitHub {target.display_name} ({mode}) -> {target.root_path}")
 
-    with FactStore(db_path) as store:
-        store.init_schema()
-        existing_hashes = store.get_file_hashes()
-        for py_file in ingester.iter_python_files():
-            rel = py_file.relative_to(repo_root).as_posix()
-            active_paths.append(rel)
-            try:
-                sha = hashlib.sha256(py_file.read_bytes()).hexdigest()
-            except OSError as exc:
-                print(f"Warning: could not read {rel} ({exc})", file=sys.stderr)
-                continue
-
-            if args.force or existing_hashes.get(rel) != sha:
-                parsed = ingester.parse_file(py_file)
-                if parsed is not None:
-                    parsed_batch.append(parsed)
-            else:
-                skipped += 1
-
-        if parsed_batch:
-            store.replace_many_file_facts(parsed_batch)
-
-        pruned = store.prune_deleted_files(active_paths)
-        blocks = store.get_block_risk_summary()
-        deps = store.get_block_dependencies()
-        cycles = store.detect_import_cycles()
-        violations = resolver.check_violations(deps)
-        coverage = TestCoverageAnalyzer(store).analyze()
-
-    reindexed = len(parsed_batch)
-    elapsed_ms = (time.perf_counter() - t0) * 1000
     print(
-        f"Scan completed in {elapsed_ms:.0f} ms -- "
-        f"{reindexed} indexed, {skipped} unchanged, {pruned} pruned."
+        f"Scan completed in {summary.elapsed_ms:.0f} ms -- "
+        f"{summary.indexed_files} indexed, {summary.skipped_files} unchanged, "
+        f"{summary.pruned_files} pruned."
     )
-    print(f"SQLite index: {db_path}")
+    print(f"SQLite index: {summary.db_path}")
     print(
-        f"Production blocks: {len(blocks)} | "
+        f"Production blocks: {len(summary.blocks)} | "
         f"Linked tests: {coverage.linked_test_files}/{coverage.total_test_files} files "
         f"({coverage.overall_file_coverage_pct:.1f}% files | "
         f"{coverage.overall_symbol_coverage_pct:.1f}% symbols)"
     )
     print(
-        f"Import cycles: {len(cycles)} | "
-        f"Architecture violations: {len(violations)}"
+        f"Import cycles: {len(summary.cycles)} | "
+        f"Architecture violations: {len(summary.violations)}"
     )
 
-    if cycles:
+    if summary.cycles:
         print("\nDetected import cycles:")
-        for cycle in cycles[:10]:
+        for cycle in summary.cycles[:10]:
             print("  - " + " -> ".join(cycle))
 
-    if violations:
+    if summary.violations:
         print("\nArchitecture violations (.codeoverlook.toml):")
-        for violation in violations:
+        for violation in summary.violations:
             print(
                 f"  - {violation['src_block']} -> {violation['dst_block']} "
                 f"({violation['edge_count']}x {violation['kind']}) : {violation['reason']}"
@@ -143,11 +133,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 def cmd_blocks(args: argparse.Namespace) -> int:
     """Display functional block summary including test coverage and risk status."""
-    repo_root = _validate_repo_dir(args.repo)
-    if repo_root is None:
+    target = _resolve_target_from_args(args)
+    if target is None:
         return 1
 
-    db_path = _require_existing_db(repo_root)
+    db_path = _require_existing_db(target)
     if db_path is None:
         return 1
 
@@ -191,11 +181,11 @@ def cmd_blocks(args: argparse.Namespace) -> int:
 
 def cmd_tests(args: argparse.Namespace) -> int:
     """Show test-to-block mapping, coverage status, and prioritized test gaps."""
-    repo_root = _validate_repo_dir(args.repo)
-    if repo_root is None:
+    target = _resolve_target_from_args(args)
+    if target is None:
         return 1
 
-    db_path = _require_existing_db(repo_root)
+    db_path = _require_existing_db(target)
     if db_path is None:
         return 1
 
@@ -275,28 +265,31 @@ def cmd_tests(args: argparse.Namespace) -> int:
 
 def cmd_slice(args: argparse.Namespace) -> int:
     """Extract a token-bounded Markdown context slice for a target symbol or file."""
-    repo_root = _validate_repo_dir(args.repo)
-    if repo_root is None:
+    target = _resolve_target_from_args(args)
+    if target is None:
         return 1
 
-    db_path = _require_existing_db(repo_root)
+    db_path = _require_existing_db(target)
     if db_path is None:
         return 1
 
-    with FactStore(db_path) as store:
-        slicer = ContextSlicer(store, repo_root)
-        result = slicer.slice_target(args.target, token_budget=args.budget, depth=args.depth)
+    result = slice_repository_target(
+        target,
+        args.target,
+        token_budget=args.budget,
+        depth=args.depth,
+    )
     print(result.markdown)
     return 0
 
 
 def cmd_mermaid(args: argparse.Namespace) -> int:
     """Generate a Mermaid diagram for architecture blocks or test coverage."""
-    repo_root = _validate_repo_dir(args.repo)
-    if repo_root is None:
+    target = _resolve_target_from_args(args)
+    if target is None:
         return 1
 
-    db_path = _require_existing_db(repo_root)
+    db_path = _require_existing_db(target)
     if db_path is None:
         return 1
 
@@ -314,14 +307,15 @@ def cmd_mermaid(args: argparse.Namespace) -> int:
 
 def cmd_html(args: argparse.Namespace) -> int:
     """Generate a standalone interactive HTML coverage and architecture explorer."""
-    repo_root = _validate_repo_dir(args.repo)
-    if repo_root is None:
+    target = _resolve_target_from_args(args)
+    if target is None:
         return 1
 
-    db_path = _require_existing_db(repo_root)
+    db_path = _require_existing_db(target)
     if db_path is None:
         return 1
 
+    repo_root = target.root_path
     resolver = BlockResolver(repo_root)
     with FactStore(db_path) as store:
         summary = store.get_block_risk_summary()
@@ -331,7 +325,7 @@ def cmd_html(args: argparse.Namespace) -> int:
         coverage = TestCoverageAnalyzer(store).analyze()
 
     html_doc = render_atlas_html(
-        repo_name=repo_root.name,
+        repo_name=target.display_name,
         coverage=coverage,
         block_summary=summary,
         dependencies=deps,
@@ -349,6 +343,64 @@ def cmd_html(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cache(args: argparse.Namespace) -> int:
+    """List locally cached GitHub repositories available for offline inspection."""
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    resolver = TargetResolver(cache_dir=cache_dir)
+    entries = resolver.list_cached_repos()
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "cache_dir": str(resolver.cache_dir),
+                    "repositories": [
+                        {
+                            "owner": e.owner,
+                            "repo": e.repo,
+                            "ref": e.ref,
+                            "checkout_path": str(e.checkout_path),
+                            "fetched_at": e.fetched_at,
+                            "indexed": e.indexed,
+                            "clone_url": e.clone_url,
+                        }
+                        for e in entries
+                    ],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    print(f"Offline cache directory: {resolver.cache_dir}")
+    if not entries:
+        print("No cached GitHub repositories found.")
+        return 0
+
+    print(f"{'REPOSITORY':<34} {'REF':<16} {'INDEXED':<9} {'FETCHED_AT'}")
+    print("-" * 82)
+    for entry in entries:
+        full_name = f"{entry.owner}/{entry.repo}"
+        indexed_str = "yes" if entry.indexed else "no"
+        fetched = entry.fetched_at[:19].replace("T", " ") if entry.fetched_at else "unknown"
+        print(f"{full_name:<34} {entry.ref:<16} {indexed_str:<9} {fetched}")
+    return 0
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    """Launch the local interactive web workbench for local folders or GitHub repos."""
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    return serve_workbench(
+        host=args.host,
+        port=args.port,
+        cache_dir=cache_dir,
+        initial_target=args.target,
+        offline_default=bool(args.offline),
+        open_browser=not bool(args.no_browser),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser for the `codeoverlook` CLI."""
     parser = argparse.ArgumentParser(
@@ -359,27 +411,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_scan = sub.add_parser("scan", help="Index (or incrementally update) a Python repository")
-    p_scan.add_argument("repo", nargs="?", default=".", help="Target repository path")
+    p_scan = sub.add_parser(
+        "scan",
+        help="Index (or incrementally update) a local folder or GitHub repository",
+    )
+    p_scan.add_argument(
+        "repo",
+        nargs="?",
+        default=".",
+        help="Local repository path or GitHub URL / owner/repo",
+    )
     p_scan.add_argument("--force", action="store_true", help="Force full re-indexing")
+    _add_source_args(p_scan, include_refresh=True)
     p_scan.set_defaults(func=cmd_scan)
 
     p_blocks = sub.add_parser(
         "blocks",
         help="Display functional blocks, risk, and test coverage summary",
     )
-    p_blocks.add_argument("repo", nargs="?", default=".", help="Target repository path")
+    p_blocks.add_argument(
+        "repo",
+        nargs="?",
+        default=".",
+        help="Local repository path or GitHub URL / owner/repo",
+    )
     p_blocks.add_argument("--json", action="store_true", help="Emit structured JSON output")
+    _add_source_args(p_blocks)
     p_blocks.set_defaults(func=cmd_blocks)
 
     p_tests = sub.add_parser(
         "tests",
         help="Show test-to-block mapping and prioritized coverage gaps",
     )
-    p_tests.add_argument("repo", nargs="?", default=".", help="Target repository path")
+    p_tests.add_argument(
+        "repo",
+        nargs="?",
+        default=".",
+        help="Local repository path or GitHub URL / owner/repo",
+    )
     p_tests.add_argument("--block", default=None, help="Filter report to one functional block")
     p_tests.add_argument("--limit", type=int, default=15, help="Max untested targets to display")
     p_tests.add_argument("--json", action="store_true", help="Emit structured JSON output")
+    _add_source_args(p_tests)
     p_tests.set_defaults(func=cmd_tests)
 
     p_slice = sub.add_parser("slice", help="Extract a compact context slice for AI agents")
@@ -387,7 +460,11 @@ def build_parser() -> argparse.ArgumentParser:
         "target",
         help="Symbol or file path (e.g. core/workspace.py or function name)",
     )
-    p_slice.add_argument("--repo", default=".", help="Target repository path")
+    p_slice.add_argument(
+        "--repo",
+        default=".",
+        help="Local repository path or GitHub URL / owner/repo",
+    )
     p_slice.add_argument(
         "--budget",
         type=int,
@@ -400,28 +477,81 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Neighborhood traversal depth (1 or 2)",
     )
+    _add_source_args(p_slice)
     p_slice.set_defaults(func=cmd_slice)
 
     p_mermaid = sub.add_parser(
         "mermaid",
         help="Generate a Mermaid graph for architecture blocks or test coverage",
     )
-    p_mermaid.add_argument("repo", nargs="?", default=".", help="Target repository path")
+    p_mermaid.add_argument(
+        "repo",
+        nargs="?",
+        default=".",
+        help="Local repository path or GitHub URL / owner/repo",
+    )
     p_mermaid.add_argument(
         "--mode",
         choices=("arch", "coverage"),
         default="arch",
         help="Diagram mode: architecture risks ('arch') or test coverage ('coverage')",
     )
+    _add_source_args(p_mermaid)
     p_mermaid.set_defaults(func=cmd_mermaid)
 
     p_html = sub.add_parser(
         "html",
         help="Generate a standalone interactive HTML block & test coverage explorer",
     )
-    p_html.add_argument("repo", nargs="?", default=".", help="Target repository path")
+    p_html.add_argument(
+        "repo",
+        nargs="?",
+        default=".",
+        help="Local repository path or GitHub URL / owner/repo",
+    )
     p_html.add_argument("--output", default=None, help="Custom output HTML file path")
+    _add_source_args(p_html, include_refresh=True)
     p_html.set_defaults(func=cmd_html)
+
+    p_cache = sub.add_parser(
+        "cache",
+        help="List GitHub repositories cached locally for offline inspection",
+    )
+    p_cache.add_argument("--json", action="store_true", help="Emit structured JSON output")
+    p_cache.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Override persistent cache directory (defaults to ~/.codeoverlook/cache)",
+    )
+    p_cache.set_defaults(func=cmd_cache)
+
+    p_ui = sub.add_parser(
+        "ui",
+        help="Start the local interactive web workbench for local folders or GitHub repos",
+    )
+    p_ui.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    p_ui.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
+    p_ui.add_argument(
+        "--target",
+        default=None,
+        help="Optional local folder or GitHub repo to inspect automatically on load",
+    )
+    p_ui.add_argument(
+        "--offline",
+        action="store_true",
+        help="Start with offline mode enabled",
+    )
+    p_ui.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not automatically open the browser",
+    )
+    p_ui.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Override persistent cache directory (defaults to ~/.codeoverlook/cache)",
+    )
+    p_ui.set_defaults(func=cmd_ui)
 
     return parser
 
@@ -432,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except (sqlite3.Error, OSError) as exc:
+    except (SourceResolutionError, FileNotFoundError, sqlite3.Error, OSError) as exc:
         print(f"CodeOverlook execution error: {exc}", file=sys.stderr)
         return 1
 
