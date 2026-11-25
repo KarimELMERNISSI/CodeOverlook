@@ -89,6 +89,9 @@ EXPLORER_CSS = """
   .pill-strong {
     background: var(--accent); color: var(--fg); font-weight: 600;
   }
+  .pill-scale {
+    background: var(--bg); color: var(--primary-strong); font-weight: 600;
+  }
   .kpis {
     display: grid; grid-template-columns: repeat(5, minmax(78px, 1fr));
     gap: 8px; text-align: center;
@@ -236,7 +239,7 @@ EXPLORER_CSS = """
     border-radius: 10px; background: var(--bg); overflow: hidden;
   }
   .viewport-canvas {
-    width: 100%; min-height: 500px; max-height: 760px;
+    width: 100%; height: clamp(440px, 66vh, 860px);
     overflow: hidden; cursor: grab; touch-action: none;
     position: relative;
     background-image: radial-gradient(var(--grid-dot) 1px, transparent 1px);
@@ -252,6 +255,8 @@ EXPLORER_CSS = """
   .svg-edge:hover { stroke-opacity: 1 !important; stroke-width: 3 !important; }
   .lane-link { cursor: pointer; }
   .lane-link:hover { text-decoration: underline; fill: var(--primary); }
+  .band-toggle { cursor: pointer; }
+  .band-toggle:hover rect { stroke: var(--primary); }
   .vp-controls {
     position: absolute; left: 12px; bottom: 12px; z-index: 20;
     display: inline-flex; align-items: center; gap: 4px; padding: 4px 6px;

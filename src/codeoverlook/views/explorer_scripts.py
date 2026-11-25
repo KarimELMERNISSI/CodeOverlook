@@ -14,10 +14,14 @@ let level = "blocks";     // "blocks" | "packages" | "modules" | "functions"
 let viewMode = "svg";     // "svg" | "cards"
 let modViewUser = null;   // null (auto) | "svg" | "table"
 let overlay = "arch";     // "arch" | "weaknesses" | "coverage" | "security"
+let densityMode = "auto"; // "auto" | "compact" | "balanced" | "detailed"
 let edgeScope = "focus";  // "focus" | "hop2" | "risks" | "all"
 let hideTooling = false;
 let fnConnectedOnly = false;
 let minimapOpen = true;
+let minimapUserSet = false;
+let nodeCap = 48;         // 48 | 96 | 99999
+const collapsedBands = new Set();
 let activeFeatureId = null;
 let scope = null;         // { level: "blocks"|"packages", id: string } | null
 let fnScope = null;       // { kind: "block"|"package"|"module", id: string, title: string }
@@ -134,9 +138,25 @@ function readHash() {
   }
 }
 
+function toggleBandCollapse(bandKey) {
+  if (collapsedBands.has(bandKey)) collapsedBands.delete(bandKey);
+  else collapsedBands.add(bandKey);
+  refreshAll(false);
+}
+
 function renderHeader() {
   const s = DATA.summary;
+  const prof = DATA.profile || {};
   $("pill-repo").textContent = DATA.repo_name;
+  const scalePill = $("pill-scale");
+  if (scalePill) {
+    if (prof.size_label) {
+      scalePill.textContent = prof.size_label;
+      scalePill.classList.remove("hidden");
+    } else {
+      scalePill.classList.add("hidden");
+    }
+  }
   $("pill-tests").textContent =
     `${s.linked_test_files}/${s.total_test_files} linked test files `
     + `(${s.total_test_functions} fns)`;
@@ -596,7 +616,7 @@ function computeEdgePaths(edges, boxes, layoutWidth) {
         + `${dx.toFixed(1)} ${c2y.toFixed(1)}, ${dx.toFixed(1)} ${dy}`;
       return { d, midX: (sx + dx) / 2, midY: (sy + dy) / 2 };
     }
-    const lane = upLane++ % 6;
+    const lane = upLane++ % 14;
     const marginX = Math.max(sb.x + sb.w, db.x + db.w) + 22 + lane * 10;
     const clampedX = Math.min(layoutWidth - 28, marginX);
     const outY = sb.y + sb.h * 0.36;
@@ -609,7 +629,30 @@ function computeEdgePaths(edges, boxes, layoutWidth) {
   });
 }
 
-function layoutDiagram(nodes, edges) {
+function resolveDensity(itemCount) {
+  if (densityMode !== "auto") return densityMode;
+  if (itemCount <= 10) return "detailed";
+  if (itemCount <= 28) return "balanced";
+  return "compact";
+}
+
+function getDensitySpec(density, maxRowItems) {
+  const base = density === "detailed"
+    ? { labelW: 236, nodeW: 236, nodeH: 88, gapX: 30, gapY: 32, maxCols: 4 }
+    : density === "compact"
+      ? { labelW: 204, nodeW: 168, nodeH: 52, gapX: 16, gapY: 16, maxCols: 9 }
+      : { labelW: 224, nodeW: 210, nodeH: 76, gapX: 26, gapY: 28, maxCols: 6 };
+  const canvas = $("viewport-canvas");
+  const canvasWidth = (canvas && canvas.clientWidth) ? canvas.clientWidth : 960;
+  const availCols = Math.floor((canvasWidth - base.labelW - 100) / (base.nodeW + base.gapX));
+  const colsCap = Math.max(
+    2,
+    Math.min(base.maxCols, Math.max(2, availCols), Math.max(2, maxRowItems))
+  );
+  return { ...base, density, colsCap };
+}
+
+function layoutDiagram(nodes, edges, density) {
   let bandRows = DATA.bands.map(b => ({
     band: b,
     items: nodes.filter(n => n.band === b.id && n.zone !== "tooling")
@@ -633,32 +676,58 @@ function layoutDiagram(nodes, edges) {
   }
 
   if (!bandRows.length) {
-    return { width: 860, height: 240, bands: [], boxes: {}, edges: [] };
+    return { width: 860, height: 240, bands: [], boxes: {}, edges: [], density: "balanced" };
   }
 
-  const labelW = 224;
-  const nodeW = 212;
-  const nodeH = 78;
-  const gapX = 28;
-  const gapY = 30;
-  const padX = 22;
-  const padY = 20;
+  const bandRankOf = {};
+  bandRows.forEach((r, idx) => r.items.forEach(n => { bandRankOf[n.id] = idx; }));
+  const upCount = edges.filter(
+    e => e.direction === "up"
+      || (bandRankOf[e.u] !== undefined && bandRankOf[e.v] !== undefined
+        && bandRankOf[e.u] > bandRankOf[e.v])
+  ).length;
+  const rightGutter = Math.max(96, 48 + Math.min(14, upCount) * 10);
 
   const maxPerRow = Math.max(1, ...bandRows.map(r => r.items.length));
-  const colsCap = Math.min(5, Math.max(2, maxPerRow));
+  const spec = getDensitySpec(density || resolveDensity(nodes.length), maxPerRow);
+  const { labelW, nodeW, nodeH, gapX, gapY, colsCap } = spec;
+  const padX = 22;
+  const padY = density === "compact" ? 14 : 20;
+
   const contentW = colsCap * nodeW + (colsCap - 1) * gapX + padX * 2;
-  const totalW = labelW + contentW + 96;
+  const totalW = labelW + contentW + rightGutter;
 
   let curY = 14;
   const placedBands = [];
   const boxes = {};
 
   bandRows.forEach(row => {
+    const bKey = `${level}:${row.band.id}`;
+    const isCollapsed = collapsedBands.has(bKey);
+    if (isCollapsed) {
+      const bandH = 44;
+      placedBands.push({
+        band: row.band,
+        bandKey: bKey,
+        collapsed: true,
+        itemCount: row.items.length,
+        x: 10, y: curY, w: totalW - rightGutter + 8, h: bandH, labelW
+      });
+      curY += bandH + 10;
+      return;
+    }
+
     const rowsCount = Math.ceil(row.items.length / colsCap);
-    const bandH = Math.max(114, padY * 2 + rowsCount * nodeH + (rowsCount - 1) * gapY);
+    const bandH = Math.max(
+      density === "compact" ? 84 : 114,
+      padY * 2 + rowsCount * nodeH + (rowsCount - 1) * gapY
+    );
     placedBands.push({
       band: row.band,
-      x: 10, y: curY, w: totalW - 88, h: bandH, labelW
+      bandKey: bKey,
+      collapsed: false,
+      itemCount: row.items.length,
+      x: 10, y: curY, w: totalW - rightGutter + 8, h: bandH, labelW
     });
 
     row.items.forEach((n, idx) => {
@@ -674,10 +743,13 @@ function layoutDiagram(nodes, edges) {
       };
     });
 
-    curY += bandH + 16;
+    curY += bandH + (density === "compact" ? 12 : 16);
   });
 
-  return { width: totalW, height: curY + 8, bands: placedBands, boxes, edges };
+  return {
+    width: totalW, height: curY + 8, bands: placedBands,
+    boxes, edges, density: spec.density
+  };
 }
 
 function applyTransform() {
@@ -712,10 +784,13 @@ function centerOnNode(nodeId) {
   applyTransform();
 }
 
-function renderMinimap(chosenId) {
+function renderMinimap(chosenId, visibleCount) {
   const mmBox = $("minimap-box");
   const mmSvg = $("minimap-svg");
   if (!mmBox || !mmSvg) return;
+  if (!minimapUserSet && typeof visibleCount === "number") {
+    minimapOpen = visibleCount > 6;
+  }
   mmBox.classList.toggle("collapsed", !minimapOpen);
   $("minimap-toggle").textContent = minimapOpen ? "-" : "+";
   if (!minimapOpen || !lastLayout.width) return;
@@ -913,15 +988,61 @@ function renderScopeBanner(htmlStr) {
   }
 }
 
+function renderCapBanner(label, totalCount, includeTableBtn) {
+  const btns = [48, 96, 99999].map(cap => {
+    const lbl = cap >= 99999 ? "All" : String(cap);
+    const active = nodeCap === cap ? "btn-on" : "";
+    return `<button type="button" class="btn btn-xs ${active}" `
+      + `data-set-cap="${cap}">${lbl}</button>`;
+  }).join("");
+  const tbl = includeTableBtn
+    ? `<button type="button" class="btn btn-xs" id="switch-mod-table-btn">`
+      + `Switch to Table (all ${totalCount})</button>`
+    : "";
+  renderScopeBanner(
+    `<span>Showing top ${Math.min(nodeCap, totalCount)} of ${totalCount} ${label} `
+    + `by coupling &amp; LOC.</span>`
+    + `<div class="row" style="gap:4px;">Cap: ${btns}${tbl}</div>`
+  );
+  $("scope-banner").querySelectorAll("[data-set-cap]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      nodeCap = Number(btn.dataset.setCap);
+      refreshAll(true);
+    });
+  });
+  const swBtn = $("switch-mod-table-btn");
+  if (swBtn) swBtn.addEventListener("click", () => {
+    modViewUser = "table";
+    refreshAll(false);
+  });
+}
+
 function renderSvgView(fitOnRender) {
-  renderScopeBanner("");
-  const { nodes, edges, nodeMap } = activeNodesAndEdges();
+  let { nodes, edges, nodeMap } = activeNodesAndEdges();
   if (!nodes.length) {
+    renderScopeBanner("");
     $("viewport-canvas").innerHTML = `<div class="muted" style="padding:20px;">No nodes.</div>`;
-    renderMinimap(null);
+    renderMinimap(null, 0);
     return;
   }
-  if (!picked[level] || !nodeMap[picked[level]]) {
+
+  if (level === "packages" && nodes.length > 48) {
+    const totalPkgs = nodes.length;
+    if (totalPkgs > nodeCap) {
+      nodes = [...nodes].sort((a, b) =>
+        ((b.imports.length + b.imported_by.length) - (a.imports.length + a.imported_by.length))
+        || (b.prod_loc - a.prod_loc)
+        || a.id.localeCompare(b.id)
+      ).slice(0, nodeCap);
+      const keepIds = new Set(nodes.map(n => n.id));
+      edges = edges.filter(e => keepIds.has(e.u) && keepIds.has(e.v));
+    }
+    renderCapBanner("packages", totalPkgs, false);
+  } else {
+    renderScopeBanner("");
+  }
+
+  if (!picked[level] || !nodeMap[picked[level]] || !nodes.some(n => n.id === picked[level])) {
     picked[level] = nodes[0].id;
   }
   const chosen = picked[level];
@@ -933,19 +1054,53 @@ function renderSvgView(fitOnRender) {
     ? new Set(level === "packages" ? feat.packages : feat.blocks)
     : null;
 
-  const shownEdges = resolveEdgesByScope(edges, chosen, featSet);
-  const layout = layoutDiagram(nodes, shownEdges);
+  const density = resolveDensity(nodes.length);
+  const shownEdgesRaw = resolveEdgesByScope(edges, chosen, featSet);
+  const layout = layoutDiagram(nodes, shownEdgesRaw, density);
   lastLayout = layout;
+
+  const visibleNodes = nodes.filter(n => Boolean(layout.boxes[n.id]));
+  const shownEdges = shownEdgesRaw.filter(
+    e => Boolean(layout.boxes[e.u]) && Boolean(layout.boxes[e.v])
+  );
+  const edgePriority = e => {
+    if (e.violation || e.direction === "violation") return 4;
+    if (e.direction === "cycle" || e.direction === "up") return 3;
+    if (e.u === chosen || e.v === chosen) return 2;
+    return 1;
+  };
+  shownEdges.sort((a, b) => edgePriority(a) - edgePriority(b));
 
   const bandsSvg = layout.bands.map(b => {
     const c = `var(--g-${b.band.group})`;
-    const titleStr = b.band.title.length > 27
-      ? b.band.title.slice(0, 25) + ".." : b.band.title;
+    const titleStr = b.band.title.length > 26
+      ? b.band.title.slice(0, 24) + ".." : b.band.title;
     const filesCnt = b.band.prod_files ?? 0;
     const locCnt = b.band.prod_loc ?? 0;
     const covAvg = b.band.avg_coverage_pct ?? 0;
-    const metaStr = `${b.band.blocks_count || 0} blk · ${filesCnt} files · `
+    const metaStr = `${b.band.blocks_count || b.itemCount || 0} blk · ${filesCnt} files · `
       + `${locCnt.toLocaleString()} LOC · ${covAvg.toFixed(0)}% cov`;
+    const toggleTxt = b.collapsed ? `+ ${b.itemCount} hidden` : "Hide";
+    const toggleW = toggleTxt.length * 6.1 + 12;
+    const toggleBtn = `<g class="band-toggle" data-toggle-band="${esc(b.bandKey)}">`
+      + `<rect x="${b.x + b.labelW - toggleW - 8}" y="${b.y + 8}" width="${toggleW}" height="17" `
+      + `rx="8.5" fill="var(--card)" stroke="var(--border)"/>`
+      + `<text x="${b.x + b.labelW - toggleW / 2 - 8}" y="${b.y + 19.5}" text-anchor="middle" `
+      + `font-size="9" font-weight="700" fill="var(--fg)">${esc(toggleTxt)}</text></g>`;
+    if (b.collapsed) {
+      return `<g>`
+        + `<rect x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="8" `
+        + `fill="${c}" fill-opacity="0.04" stroke="${c}" stroke-opacity="0.3"/>`
+        + `<rect x="${b.x}" y="${b.y}" width="${b.labelW}" height="${b.h}" rx="8" `
+        + `fill="${c}" fill-opacity="0.12"/>`
+        + `<text x="${b.x + 12}" y="${b.y + 20}" font-size="10.5" font-weight="700" `
+        + `fill="${c}">${esc(b.band.label)}</text>`
+        + `<text x="${b.x + 12}" y="${b.y + 35}" font-size="11.5" font-weight="700" `
+        + `fill="var(--fg)">${esc(titleStr)}</text>`
+        + `<text x="${b.x + b.labelW + 16}" y="${b.y + 26}" font-size="11" `
+        + `fill="var(--muted)">Collapsed (${b.itemCount} hidden — click pill to expand)</text>`
+        + `${toggleBtn}</g>`;
+    }
     return `<g>`
       + `<rect x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="8" `
       + `fill="${c}" fill-opacity="0.05" stroke="${c}" stroke-opacity="0.3"/>`
@@ -955,14 +1110,17 @@ function renderSvgView(fitOnRender) {
       + `fill="${c}">${esc(b.band.label)}</text>`
       + `<text x="${b.x + 12}" y="${b.y + 39}" font-size="12" font-weight="700" `
       + `fill="var(--fg)">${esc(titleStr)}</text>`
-      + `<text x="${b.x + 12}" y="${b.y + 57}" font-size="10.5" `
+      + `<text x="${b.x + 12}" y="${b.y + 57}" font-size="10" `
       + `fill="var(--muted)">${esc(metaStr)}</text>`
-      + `<text x="${b.x + 12}" y="${b.y + b.h - 10}" font-size="10" `
-      + `fill="var(--muted)">${esc((b.band.desc || "").slice(0, 31))}</text>`
-      + `</g>`;
+      + (b.h >= 102
+        ? `<text x="${b.x + 12}" y="${b.y + b.h - 10}" font-size="10" `
+          + `fill="var(--muted)">${esc((b.band.desc || "").slice(0, 31))}</text>`
+        : "")
+      + `${toggleBtn}</g>`;
   }).join("");
 
   const routed = computeEdgePaths(shownEdges, layout.boxes, layout.width);
+  const denseGraph = shownEdges.length > 50;
   const edgeBadges = [];
   const arrowsSvg = shownEdges.map((e, idx) => {
     const route = routed[idx];
@@ -972,7 +1130,7 @@ function renderSvgView(fitOnRender) {
     const dir = e.direction || "";
     let stroke = "var(--muted)";
     let marker = "m-muted";
-    let opacity = "0.42";
+    let opacity = denseGraph ? "0.20" : "0.42";
     let sw = 1.2;
     let dash = "";
     if (e.violation || dir === "violation") {
@@ -990,7 +1148,8 @@ function renderSvgView(fitOnRender) {
       stroke = "var(--edge-up)"; marker = "m-up"; opacity = "0.95";
       sw = Math.min(3.5, 1.5 + Math.log2(1 + e.n) * 0.65);
     }
-    if ((isOut || isIn || e.violation || dir === "up") && edgeBadges.length < 14 && e.n > 1) {
+    const wantBadge = isOut || isIn || e.violation || (!denseGraph && dir === "up");
+    if (wantBadge && edgeBadges.length < 14 && e.n > 1) {
       edgeBadges.push({ x: route.midX, y: route.midY, n: e.n, color: stroke });
     }
     return `<path class="svg-edge" d="${route.d}" fill="none" stroke="${stroke}" `
@@ -1007,7 +1166,7 @@ function renderSvgView(fitOnRender) {
     + `font-size="9" font-weight="700" fill="${b.color}">${b.n}</text></g>`
   ).join("");
 
-  const nodesSvg = nodes.map(n => {
+  const nodesSvg = visibleNodes.map(n => {
     const p = layout.boxes[n.id];
     const isSel = n.id === chosen;
     const isUse = uses.has(n.id);
@@ -1036,7 +1195,9 @@ function renderSvgView(fitOnRender) {
       badgeBg = wTags[0] === "CYCLE" || wTags[0] === "BACK-EDGE" ? "var(--bad)" : "var(--warn)";
     }
     const bw = badge.length * 6.0 + 12;
-    const titleTxt = n.title.length > 23 ? n.title.slice(0, 21) + ".." : n.title;
+    const maxChars = density === "compact" ? 18 : density === "detailed" ? 26 : 23;
+    const titleTxt = n.title.length > maxChars
+      ? n.title.slice(0, maxChars - 2) + ".." : n.title;
     const covPct = n.file_coverage_pct || 0;
     const barMaxW = p.w - 46;
     const covW = Math.max(0, Math.min(barMaxW, (covPct / 100) * barMaxW));
@@ -1046,25 +1207,44 @@ function renderSvgView(fitOnRender) {
     const untSinks = n.untested_sinks || 0;
 
     let badgeEl = "";
-    if (badge) {
+    if (badge && (density !== "compact" || isSel || hasViolation)) {
       badgeEl = `<rect x="${p.x + p.w - bw - 6}" y="${p.y - 8}" width="${bw}" height="15" `
         + `rx="7.5" fill="${badgeBg}"/>`
         + `<text x="${p.x + p.w - bw / 2 - 6}" y="${p.y + 3}" text-anchor="middle" `
         + `font-size="8.5" font-weight="700" fill="var(--on-primary)">${esc(badge)}</text>`;
     }
 
+    let bodyLines = "";
+    if (density === "compact") {
+      bodyLines =
+        `<text x="${p.x + 12}" y="${p.y + 19}" font-size="11.5" font-weight="700" `
+        + `fill="var(--fg)">${esc(titleTxt)}</text>`
+        + `<text x="${p.x + 12}" y="${p.y + 34}" font-size="9.5" `
+        + `fill="var(--muted)">${esc(nodeSubtitle(n))}</text>`;
+    } else {
+      bodyLines =
+        `<text x="${p.x + 14}" y="${p.y + 22}" font-size="12.5" font-weight="700" `
+        + `fill="var(--fg)">${esc(titleTxt)}</text>`
+        + `<text x="${p.x + 14}" y="${p.y + 39}" font-size="10.5" `
+        + `fill="var(--muted)">${esc(nodeSubtitle(n))}</text>`
+        + `<text x="${p.x + 14}" y="${p.y + 54}" font-size="10" `
+        + `fill="${untSinks > 0 ? "var(--bad)" : "var(--muted)"}">`
+        + `in ${inDeg} · out ${outDeg}`
+        + `${untSinks > 0 ? ` · ${untSinks} unt. sinks` : ""}</text>`;
+      if (density === "detailed") {
+        const libsStr = (n.external_libs || []).slice(0, 2).join(", ") || "stdlib";
+        const detStr = `${n.role || "module"} · ${libsStr}`;
+        const detShort = detStr.length > 29 ? detStr.slice(0, 27) + ".." : detStr;
+        bodyLines += `<text x="${p.x + 14}" y="${p.y + 69}" font-size="9.5" `
+          + `fill="var(--primary-strong)">${esc(detShort)}</text>`;
+      }
+    }
+
     return `<g opacity="${dim ? 0.36 : 1}">`
       + `<rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="7" `
       + `fill="var(--card)" stroke="${stroke}" stroke-width="${sw}"/>`
       + `<rect x="${p.x}" y="${p.y}" width="5" height="${p.h}" rx="2" fill="${accent}"/>`
-      + `<text x="${p.x + 14}" y="${p.y + 22}" font-size="12.5" font-weight="700" `
-      + `fill="var(--fg)">${esc(titleTxt)}</text>`
-      + `<text x="${p.x + 14}" y="${p.y + 39}" font-size="10.5" `
-      + `fill="var(--muted)">${esc(nodeSubtitle(n))}</text>`
-      + `<text x="${p.x + 14}" y="${p.y + 54}" font-size="10" `
-      + `fill="${untSinks > 0 ? "var(--bad)" : "var(--muted)"}">`
-      + `in ${inDeg} · out ${outDeg}`
-      + `${untSinks > 0 ? ` · ${untSinks} unt. sinks` : ""}</text>`
+      + bodyLines
       + `<rect x="${p.x + 12}" y="${p.y + p.h - 10}" width="${barMaxW}" height="3.5" `
       + `rx="1.7" fill="var(--border)"/>`
       + `<rect x="${p.x + 12}" y="${p.y + p.h - 10}" width="${covW.toFixed(1)}" height="3.5" `
@@ -1094,6 +1274,13 @@ function renderSvgView(fitOnRender) {
     `<svg id="arch-svg" width="${layout.width}" height="${layout.height}" `
     + `viewBox="0 0 ${layout.width} ${layout.height}">`
     + `${markerDefs()}${bandsSvg}${guideSvg}${arrowsSvg}${nodesSvg}${badgesSvg}</svg>`;
+
+  $("viewport-canvas").querySelectorAll("[data-toggle-band]").forEach(el => {
+    el.addEventListener("click", ev => {
+      ev.stopPropagation();
+      toggleBandCollapse(el.dataset.toggleBand);
+    });
+  });
 
   $("viewport-canvas").querySelectorAll("[data-node]").forEach(el => {
     const n = nodeMap[el.dataset.node];
@@ -1131,9 +1318,9 @@ function renderSvgView(fitOnRender) {
       <i class="swatch" style="background:var(--edge-up)"></i>Imports the focus / back-edge
     </span>
     <span><i class="swatch" style="background:var(--bad)"></i>Cycle or forbidden violation</span>
-    <span>Bottom bar = file coverage | Double-click node for internals</span>`;
+    <span>Density: ${esc(layout.density)} | Double-click node for internals</span>`;
 
-  renderMinimap(chosen);
+  renderMinimap(chosen, visibleNodes.length);
   if (fitOnRender) fitToViewport();
   else applyTransform();
 }
@@ -1160,32 +1347,21 @@ function renderModulesSvg(fitOnRender) {
     renderScopeBanner("");
     $("viewport-canvas").innerHTML =
       `<div class="muted" style="padding:20px;">No matching modules.</div>`;
-    renderMinimap(null);
+    renderMinimap(null, 0);
     return;
   }
 
   let rows = allRows;
-  let capped = false;
   if (allRows.length > 48) {
-    capped = true;
-    rows = [...allRows].sort((a, b) =>
-      ((b.imports.length + b.imported_by.length) - (a.imports.length + a.imported_by.length))
-      || (b.sinks - a.sinks)
-      || (b.loc - a.loc)
-      || a.path.localeCompare(b.path)
-    ).slice(0, 48);
-  }
-
-  if (capped) {
-    renderScopeBanner(
-      `<span>Showing top 48 of ${allRows.length} modules by coupling &amp; LOC.</span>`
-      + `<button type="button" class="btn btn-xs" id="switch-mod-table-btn">`
-      + `Switch to Table (all ${allRows.length})</button>`
-    );
-    $("switch-mod-table-btn").addEventListener("click", () => {
-      modViewUser = "table";
-      refreshAll(false);
-    });
+    if (allRows.length > nodeCap) {
+      rows = [...allRows].sort((a, b) =>
+        ((b.imports.length + b.imported_by.length) - (a.imports.length + a.imported_by.length))
+        || (b.sinks - a.sinks)
+        || (b.loc - a.loc)
+        || a.path.localeCompare(b.path)
+      ).slice(0, nodeCap);
+    }
+    renderCapBanner("modules", allRows.length, true);
   } else {
     renderScopeBanner(
       `<span>Showing ${rows.length} modules. Double-click any module card for functions.</span>`
@@ -1196,7 +1372,6 @@ function renderModulesSvg(fitOnRender) {
     picked.modules = rows[0].path;
   }
   const chosen = picked.modules;
-  const modSet = new Set(rows.map(r => r.path));
 
   const laneMap = new Map();
   const usePkgLane = scope && scope.level === "blocks";
@@ -1206,28 +1381,43 @@ function renderModulesSvg(fitOnRender) {
     laneMap.get(lk).push(m);
   });
 
-  const labelW = 200;
-  const nodeW = 214;
-  const nodeH = 66;
-  const gapX = 24;
-  const gapY = 24;
-  const padX = 20;
-  const padY = 16;
   const lanes = [...laneMap.entries()];
   const maxItems = Math.max(1, ...lanes.map(([, arr]) => arr.length));
-  const colsCap = Math.min(4, Math.max(2, maxItems));
+  const density = resolveDensity(rows.length);
+  const spec = getDensitySpec(density, maxItems);
+  const labelW = Math.min(200, spec.labelW);
+  const nodeW = density === "compact" ? 176 : 214;
+  const nodeH = density === "compact" ? 54 : 66;
+  const gapX = spec.gapX;
+  const gapY = density === "compact" ? 16 : 24;
+  const padX = 20;
+  const padY = density === "compact" ? 12 : 16;
+  const colsCap = spec.colsCap;
   const contentW = colsCap * nodeW + (colsCap - 1) * gapX + padX * 2;
-  const totalW = labelW + contentW + 76;
+  const totalW = labelW + contentW + 100;
 
   let curY = 14;
   const placedLanes = [];
   const boxes = {};
   lanes.forEach(([title, arr]) => {
+    const bKey = `modules:${title}`;
+    const isCollapsed = collapsedBands.has(bKey);
+    if (isCollapsed) {
+      const laneH = 44;
+      placedLanes.push({
+        band: { title, label: usePkgLane ? "PKG" : "BLK", group: "services" },
+        bandKey: bKey, collapsed: true, title, count: arr.length,
+        x: 10, y: curY, w: totalW - 88, h: laneH
+      });
+      curY += laneH + 10;
+      return;
+    }
     const rowsCount = Math.ceil(arr.length / colsCap);
-    const laneH = Math.max(96, padY * 2 + rowsCount * nodeH + (rowsCount - 1) * gapY);
+    const laneH = Math.max(88, padY * 2 + rowsCount * nodeH + (rowsCount - 1) * gapY);
     placedLanes.push({
       band: { title, label: usePkgLane ? "PKG" : "BLK", group: "services" },
-      title, count: arr.length, x: 10, y: curY, w: totalW - 68, h: laneH
+      bandKey: bKey, collapsed: false, title, count: arr.length,
+      x: 10, y: curY, w: totalW - 88, h: laneH
     });
     arr.forEach((m, idx) => {
       const rIdx = Math.floor(idx / colsCap);
@@ -1238,31 +1428,50 @@ function renderModulesSvg(fitOnRender) {
         w: nodeW, h: nodeH
       };
     });
-    curY += laneH + 14;
+    curY += laneH + 12;
   });
 
-  lastLayout = { width: totalW, height: curY + 8, bands: placedLanes, boxes };
+  lastLayout = { width: totalW, height: curY + 8, bands: placedLanes, boxes, density };
 
+  const visibleRows = rows.filter(m => Boolean(boxes[m.path]));
+  const modSet = new Set(visibleRows.map(r => r.path));
   const allEdges = [];
-  rows.forEach(m => {
+  visibleRows.forEach(m => {
     (m.imports || []).forEach(dst => {
       if (modSet.has(dst) && dst !== m.path) allEdges.push({ u: m.path, v: dst, n: 1 });
     });
   });
   const shownEdges = resolveEdgesByScope(allEdges, chosen, null);
+  shownEdges.sort((a, b) =>
+    ((a.u === chosen || a.v === chosen) ? 1 : 0)
+    - ((b.u === chosen || b.v === chosen) ? 1 : 0)
+  );
   const routed = computeEdgePaths(shownEdges, boxes, totalW);
+  const denseGraph = shownEdges.length > 50;
 
   const lanesSvg = placedLanes.map(l => {
-    const shortTitle = l.title.length > 23 ? l.title.slice(0, 21) + ".." : l.title;
+    const shortTitle = l.title.length > 22 ? l.title.slice(0, 20) + ".." : l.title;
+    const toggleTxt = l.collapsed ? `+ ${l.count}` : "Hide";
+    const toggleW = toggleTxt.length * 6.0 + 12;
+    const toggleBtn = `<g class="band-toggle" data-toggle-band="${esc(l.bandKey)}">`
+      + `<rect x="${l.x + labelW - toggleW - 20}" y="${l.y + 8}" width="${toggleW}" height="16" `
+      + `rx="8" fill="var(--card)" stroke="var(--border)"/>`
+      + `<text x="${l.x + labelW - toggleW / 2 - 20}" y="${l.y + 19}" text-anchor="middle" `
+      + `font-size="9" font-weight="700" fill="var(--fg)">${esc(toggleTxt)}</text></g>`;
     return `<g>`
       + `<rect x="${l.x}" y="${l.y}" width="${l.w}" height="${l.h}" rx="8" `
       + `fill="var(--primary)" fill-opacity="0.04" stroke="var(--border)"/>`
       + `<rect x="${l.x}" y="${l.y}" width="${labelW - 14}" height="${l.h}" rx="8" `
       + `fill="var(--primary)" fill-opacity="0.09"/>`
-      + `<text x="${l.x + 12}" y="${l.y + 24}" font-size="12" font-weight="700" `
+      + `<text x="${l.x + 12}" y="${l.y + 23}" font-size="12" font-weight="700" `
       + `fill="var(--fg)">${esc(shortTitle)}</text>`
-      + `<text x="${l.x + 12}" y="${l.y + 42}" font-size="10.5" `
-      + `fill="var(--muted)">${l.count} modules</text></g>`;
+      + `<text x="${l.x + 12}" y="${l.y + 39}" font-size="10" `
+      + `fill="var(--muted)">${l.count} modules</text>`
+      + (l.collapsed
+        ? `<text x="${l.x + labelW + 12}" y="${l.y + 26}" font-size="11" `
+          + `fill="var(--muted)">Collapsed (${l.count} modules hidden)</text>`
+        : "")
+      + `${toggleBtn}</g>`;
   }).join("");
 
   const arrowsSvg = shownEdges.map((e, idx) => {
@@ -1273,7 +1482,7 @@ function renderModulesSvg(fitOnRender) {
     const stroke = isOut ? "var(--edge-down)" : isIn ? "var(--edge-up)" : "var(--muted)";
     const marker = isOut ? "m-down" : isIn ? "m-up" : "m-muted";
     const sw = (isOut || isIn) ? 1.9 : 1.1;
-    const op = (isOut || isIn) ? 0.92 : 0.35;
+    const op = (isOut || isIn) ? 0.92 : (denseGraph ? 0.18 : 0.35);
     return `<path class="svg-edge" d="${route.d}" fill="none" stroke="${stroke}" `
       + `stroke-opacity="${op}" stroke-width="${sw}" `
       + `marker-end="url(#${marker})"><title>${esc(e.u)} -> ${esc(e.v)}</title></path>`;
@@ -1283,7 +1492,7 @@ function renderModulesSvg(fitOnRender) {
   const uses = new Set(selMod.imports || []);
   const usedBy = new Set(selMod.imported_by || []);
 
-  const nodesSvg = rows.map(m => {
+  const nodesSvg = visibleRows.map(m => {
     const p = boxes[m.path];
     const isSel = m.path === chosen;
     const isOut = uses.has(m.path);
@@ -1293,20 +1502,27 @@ function renderModulesSvg(fitOnRender) {
     const stroke = isSel ? "var(--primary)" : isOut ? "var(--edge-down)"
       : isIn ? "var(--edge-up)" : "var(--border)";
     const baseName = m.path.split("/").pop() || m.path;
-    const shortName = baseName.length > 24 ? baseName.slice(0, 22) + ".." : baseName;
+    const maxN = density === "compact" ? 19 : 24;
+    const shortName = baseName.length > maxN ? baseName.slice(0, maxN - 2) + ".." : baseName;
     const meta = `${m.loc} LOC · in ${m.imported_by.length} / out ${m.imports.length}`;
     const tail = `${m.tested ? "TESTED" : "UNTESTED"}${m.sinks > 0 ? ` · ${m.sinks} SINK` : ""}`;
+    const textHtml = density === "compact"
+      ? `<text x="${p.x + 11}" y="${p.y + 21}" font-size="11.5" font-weight="700" `
+        + `fill="var(--fg)">${esc(shortName)}</text>`
+        + `<text x="${p.x + 11}" y="${p.y + 39}" font-size="9.5" `
+        + `fill="var(--muted)">${esc(meta)}</text>`
+      : `<text x="${p.x + 12}" y="${p.y + 21}" font-size="12" font-weight="700" `
+        + `fill="var(--fg)">${esc(shortName)}</text>`
+        + `<text x="${p.x + 12}" y="${p.y + 38}" font-size="10.5" `
+        + `fill="var(--muted)">${esc(meta)}</text>`
+        + `<text x="${p.x + 12}" y="${p.y + 54}" font-size="10" font-weight="600" `
+        + `fill="${m.sinks > 0 ? "var(--bad)" : m.tested ? "var(--ok)" : "var(--warn)"}">`
+        + `${esc(tail)}</text>`;
     return `<g opacity="${dim ? 0.38 : 1}">`
       + `<rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="7" `
       + `fill="var(--card)" stroke="${stroke}" stroke-width="${isSel ? 2.4 : 1.3}"/>`
       + `<rect x="${p.x}" y="${p.y}" width="4.5" height="${p.h}" rx="2" fill="${accent}"/>`
-      + `<text x="${p.x + 12}" y="${p.y + 21}" font-size="12" font-weight="700" `
-      + `fill="var(--fg)">${esc(shortName)}</text>`
-      + `<text x="${p.x + 12}" y="${p.y + 38}" font-size="10.5" `
-      + `fill="var(--muted)">${esc(meta)}</text>`
-      + `<text x="${p.x + 12}" y="${p.y + 54}" font-size="10" font-weight="600" `
-      + `fill="${m.sinks > 0 ? "var(--bad)" : m.tested ? "var(--ok)" : "var(--warn)"}">`
-      + `${esc(tail)}</text>`
+      + textHtml
       + `<rect class="svg-node" data-mod-node="${esc(m.path)}" x="${p.x}" y="${p.y}" `
       + `width="${p.w}" height="${p.h}" rx="7" fill="transparent"/>`
       + `</g>`;
@@ -1316,6 +1532,13 @@ function renderModulesSvg(fitOnRender) {
     `<svg id="arch-svg" width="${totalW}" height="${curY + 8}" `
     + `viewBox="0 0 ${totalW} ${curY + 8}">`
     + `${markerDefs()}${lanesSvg}${arrowsSvg}${nodesSvg}</svg>`;
+
+  $("viewport-canvas").querySelectorAll("[data-toggle-band]").forEach(el => {
+    el.addEventListener("click", ev => {
+      ev.stopPropagation();
+      toggleBandCollapse(el.dataset.toggleBand);
+    });
+  });
 
   $("viewport-canvas").querySelectorAll("[data-mod-node]").forEach(el => {
     const m = MOD_MAP[el.dataset.modNode];
@@ -1349,9 +1572,9 @@ function renderModulesSvg(fitOnRender) {
   $("diagram-legend").innerHTML = `
     <span><i class="swatch" style="background:var(--edge-down)"></i>Imports</span>
     <span><i class="swatch" style="background:var(--edge-up)"></i>Imported by</span>
-    <span>Showing ${rows.length} modules &amp; ${shownEdges.length} edges</span>`;
+    <span>Showing ${visibleRows.length} modules &amp; ${shownEdges.length} edges</span>`;
 
-  renderMinimap(chosen);
+  renderMinimap(chosen, visibleRows.length);
   if (fitOnRender) fitToViewport();
   else applyTransform();
 }
@@ -1432,17 +1655,40 @@ function renderFunctionsSvg(fitOnRender) {
 
   const lanes = [...laneMap.entries()];
   const maxItems = Math.max(1, ...lanes.map(([, arr]) => arr.length));
-  const colsCap = Math.min(maxCols, Math.max(2, maxItems));
+  const density = resolveDensity(syms.length);
+  const spec = getDensitySpec(density, maxItems);
+  const labelW = Math.min(205, spec.labelW);
+  const nodeW = density === "compact" ? 194 : 228;
+  const nodeH = density === "compact" ? 56 : 68;
+  const gapX = spec.gapX;
+  const gapY = density === "compact" ? 16 : 24;
+  const padX = 20;
+  const padY = density === "compact" ? 12 : 16;
+  const colsCap = spec.colsCap;
   const contentW = colsCap * nodeW + (colsCap - 1) * gapX + padX * 2;
-  const totalW = labelW + contentW + 76;
+  const totalW = labelW + contentW + 100;
 
   let curY = 14;
   const placedLanes = [];
   const boxes = {};
   lanes.forEach(([title, arr]) => {
+    const bKey = `functions:${title}`;
+    const isCollapsed = collapsedBands.has(bKey);
+    if (isCollapsed) {
+      const laneH = 44;
+      placedLanes.push({
+        bandKey: bKey, collapsed: true, title, count: arr.length,
+        x: 10, y: curY, w: totalW - 88, h: laneH
+      });
+      curY += laneH + 10;
+      return;
+    }
     const rowsCount = Math.ceil(arr.length / colsCap);
-    const laneH = Math.max(96, padY * 2 + rowsCount * nodeH + (rowsCount - 1) * gapY);
-    placedLanes.push({ title, count: arr.length, x: 10, y: curY, w: totalW - 68, h: laneH });
+    const laneH = Math.max(88, padY * 2 + rowsCount * nodeH + (rowsCount - 1) * gapY);
+    placedLanes.push({
+      bandKey: bKey, collapsed: false, title, count: arr.length,
+      x: 10, y: curY, w: totalW - 88, h: laneH
+    });
     arr.forEach((s, idx) => {
       const rIdx = Math.floor(idx / colsCap);
       const cIdx = idx % colsCap;
@@ -1452,30 +1698,50 @@ function renderFunctionsSvg(fitOnRender) {
         w: nodeW, h: nodeH
       };
     });
-    curY += laneH + 14;
+    curY += laneH + 12;
   });
 
-  lastLayout = { width: totalW, height: curY + 8, bands: placedLanes, boxes };
+  lastLayout = { width: totalW, height: curY + 8, bands: placedLanes, boxes, density };
+
+  const visibleSyms = syms.filter(s => Boolean(boxes[s.id]));
+  const visibleEdges = edges.filter(e => Boolean(boxes[e.u]) && Boolean(boxes[e.v]));
 
   const lanesSvg = placedLanes.map(l => {
-    const shortTitle = l.title.length > 24 ? "..." + l.title.slice(-22) : l.title;
+    const shortTitle = l.title.length > 22 ? "..." + l.title.slice(-20) : l.title;
     const clickable = fnScope.kind !== "module" && MOD_MAP[l.title];
+    const toggleTxt = l.collapsed ? `+ ${l.count}` : "Hide";
+    const toggleW = toggleTxt.length * 6.0 + 12;
+    const toggleBtn = `<g class="band-toggle" data-toggle-band="${esc(l.bandKey)}">`
+      + `<rect x="${l.x + labelW - toggleW - 20}" y="${l.y + 8}" width="${toggleW}" height="16" `
+      + `rx="8" fill="var(--card)" stroke="var(--border)"/>`
+      + `<text x="${l.x + labelW - toggleW / 2 - 20}" y="${l.y + 19}" text-anchor="middle" `
+      + `font-size="9" font-weight="700" fill="var(--fg)">${esc(toggleTxt)}</text></g>`;
     return `<g>`
       + `<rect x="${l.x}" y="${l.y}" width="${l.w}" height="${l.h}" rx="8" `
       + `fill="var(--primary)" fill-opacity="0.04" stroke="var(--border)"/>`
       + `<rect x="${l.x}" y="${l.y}" width="${labelW - 14}" height="${l.h}" rx="8" `
       + `fill="var(--primary)" fill-opacity="0.09"/>`
-      + `<text x="${l.x + 12}" y="${l.y + 24}" font-size="11.5" font-weight="700" `
+      + `<text x="${l.x + 12}" y="${l.y + 23}" font-size="11.5" font-weight="700" `
       + `fill="var(--fg)" class="${clickable ? "lane-link" : ""}" `
       + `${clickable ? `data-lane-mod="${esc(l.title)}"` : ""}>${esc(shortTitle)}</text>`
-      + `<text x="${l.x + 12}" y="${l.y + 42}" font-size="10.5" `
-      + `fill="var(--muted)">${l.count} symbols</text></g>`;
+      + `<text x="${l.x + 12}" y="${l.y + 39}" font-size="10" `
+      + `fill="var(--muted)">${l.count} symbols</text>`
+      + (l.collapsed
+        ? `<text x="${l.x + labelW + 12}" y="${l.y + 26}" font-size="11" `
+          + `fill="var(--muted)">Collapsed (${l.count} symbols hidden)</text>`
+        : "")
+      + `${toggleBtn}</g>`;
   }).join("");
 
-  const outSet = new Set(edges.filter(e => e.u === chosen).map(e => e.v));
-  const inSet = new Set(edges.filter(e => e.v === chosen).map(e => e.u));
-  const shownEdges = resolveEdgesByScope(edges, chosen, null);
+  const outSet = new Set(visibleEdges.filter(e => e.u === chosen).map(e => e.v));
+  const inSet = new Set(visibleEdges.filter(e => e.v === chosen).map(e => e.u));
+  const shownEdges = resolveEdgesByScope(visibleEdges, chosen, null);
+  shownEdges.sort((a, b) =>
+    ((a.u === chosen || a.v === chosen) ? 1 : 0)
+    - ((b.u === chosen || b.v === chosen) ? 1 : 0)
+  );
   const routed = computeEdgePaths(shownEdges, boxes, totalW);
+  const denseGraph = shownEdges.length > 50;
 
   const arrowsSvg = shownEdges.map((e, idx) => {
     const route = routed[idx];
@@ -1488,13 +1754,13 @@ function renderFunctionsSvg(fitOnRender) {
     const marker = isInh ? "m-inh" : isOut ? "m-down" : isIn ? "m-up" : "m-muted";
     const dash = isInh ? 'stroke-dasharray="4 3"' : "";
     const sw = (isOut || isIn) ? 2.0 : 1.2;
-    const opacity = (isOut || isIn) ? 0.95 : 0.42;
+    const opacity = (isOut || isIn) ? 0.95 : (denseGraph ? 0.18 : 0.42);
     return `<path class="svg-edge" d="${route.d}" fill="none" stroke="${stroke}" `
       + `stroke-opacity="${opacity}" stroke-width="${sw}" ${dash} marker-end="url(#${marker})">`
       + `<title>${esc(e.u)} ${e.kind} ${esc(e.v)}</title></path>`;
   }).join("");
 
-  const nodesSvg = syms.map(s => {
+  const nodesSvg = visibleSyms.map(s => {
     const p = boxes[s.id];
     const isSel = s.id === chosen;
     const isOut = outSet.has(s.id);
@@ -1506,7 +1772,7 @@ function renderFunctionsSvg(fitOnRender) {
     const stroke = isSel ? "var(--primary)" : isOut ? "var(--edge-down)"
       : isIn ? "var(--edge-up)" : "var(--border)";
     const kindLbl = s.kind === "class" ? "CLASS" : s.kind === "method" ? "METHOD" : "FN";
-    const nameTxt = s.name.length > 22 ? s.name.slice(0, 20) + ".." : s.name;
+    const nameTxt = s.name.length > 21 ? s.name.slice(0, 19) + ".." : s.name;
     const sigClean = (s.signature || "")
       .replace(/^(?:async )?def [^(]+/, "")
       .replace(/^class /, "");
@@ -1514,16 +1780,23 @@ function renderFunctionsSvg(fitOnRender) {
     const metaTxt = `${kindLbl} · L${s.line} · deg ${s.degree}`
       + (s.tested ? " · TESTED" : "") + (s.sinks > 0 ? ` · ${s.sinks} SINK` : "");
 
+    const bodyHtml = density === "compact"
+      ? `<text x="${p.x + 11}" y="${p.y + 21}" font-size="11.5" font-weight="700" `
+        + `fill="var(--fg)">${esc(nameTxt)}</text>`
+        + `<text x="${p.x + 11}" y="${p.y + 39}" font-size="9.5" `
+        + `fill="${s.sinks > 0 ? "var(--bad)" : "var(--muted)"}">${esc(metaTxt)}</text>`
+      : `<text x="${p.x + 12}" y="${p.y + 20}" font-size="12" font-weight="700" `
+        + `fill="var(--fg)">${esc(nameTxt)}</text>`
+        + `<text x="${p.x + 12}" y="${p.y + 37}" font-size="10" class="mono" `
+        + `fill="var(--code)">${esc(sigPrev)}</text>`
+        + `<text x="${p.x + 12}" y="${p.y + 54}" font-size="10" `
+        + `fill="${s.sinks > 0 ? "var(--bad)" : "var(--muted)"}">${esc(metaTxt)}</text>`;
+
     return `<g opacity="${dim ? 0.42 : 1}">`
       + `<rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="7" `
       + `fill="var(--card)" stroke="${stroke}" stroke-width="${isSel ? 2.4 : 1.3}"/>`
       + `<rect x="${p.x}" y="${p.y}" width="4.5" height="${p.h}" rx="2" fill="${accent}"/>`
-      + `<text x="${p.x + 12}" y="${p.y + 20}" font-size="12" font-weight="700" `
-      + `fill="var(--fg)">${esc(nameTxt)}</text>`
-      + `<text x="${p.x + 12}" y="${p.y + 37}" font-size="10" class="mono" `
-      + `fill="var(--code)">${esc(sigPrev)}</text>`
-      + `<text x="${p.x + 12}" y="${p.y + 54}" font-size="10" `
-      + `fill="${s.sinks > 0 ? "var(--bad)" : "var(--muted)"}">${esc(metaTxt)}</text>`
+      + bodyHtml
       + `<rect class="svg-node" data-fn="${esc(s.id)}" x="${p.x}" y="${p.y}" `
       + `width="${p.w}" height="${p.h}" rx="7" fill="transparent"/>`
       + `</g>`;
@@ -1533,6 +1806,13 @@ function renderFunctionsSvg(fitOnRender) {
     `<svg id="arch-svg" width="${totalW}" height="${curY + 8}" `
     + `viewBox="0 0 ${totalW} ${curY + 8}">`
     + `${markerDefs()}${lanesSvg}${arrowsSvg}${nodesSvg}</svg>`;
+
+  $("viewport-canvas").querySelectorAll("[data-toggle-band]").forEach(el => {
+    el.addEventListener("click", ev => {
+      ev.stopPropagation();
+      toggleBandCollapse(el.dataset.toggleBand);
+    });
+  });
 
   $("viewport-canvas").querySelectorAll("[data-lane-mod]").forEach(el => {
     el.addEventListener("click", ev => {
@@ -1567,9 +1847,11 @@ function renderFunctionsSvg(fitOnRender) {
     <span><i class="swatch" style="background:var(--edge-down)"></i>Calls</span>
     <span><i class="swatch" style="background:var(--edge-up)"></i>Called by</span>
     <span><i class="swatch" style="background:var(--g-inherit)"></i>Inherits</span>
-    <span>Showing ${syms.length}/${totalSyms} symbols &amp; ${shownEdges.length} edges</span>`;
+    <span>
+      Showing ${visibleSyms.length}/${totalSyms} symbols &amp; ${shownEdges.length} edges
+    </span>`;
 
-  renderMinimap(chosen);
+  renderMinimap(chosen, visibleSyms.length);
   if (fitOnRender) fitToViewport();
   else applyTransform();
 }
@@ -1715,6 +1997,7 @@ function renderArchArea(fitOnRender) {
   $("view-toggle-group").classList.toggle("hidden", isMod || isFn);
   $("mod-view-group").classList.toggle("hidden", !isMod);
   $("overlay-toggle-group").classList.toggle("hidden", isMod || isFn);
+  $("density-toggle-group").classList.toggle("hidden", !showDiagram);
   $("edge-scope-group").classList.toggle("hidden", !showDiagram);
   $("toggle-tooling-btn").classList.toggle(
     "hidden", isMod || isFn || !(DATA.tooling_blocks || []).length
@@ -1735,6 +2018,9 @@ function renderArchArea(fitOnRender) {
   });
   document.querySelectorAll("[data-overlay]").forEach(b => {
     b.classList.toggle("btn-on", b.dataset.overlay === overlay);
+  });
+  document.querySelectorAll("[data-density]").forEach(b => {
+    b.classList.toggle("btn-on", b.dataset.density === densityMode);
   });
   document.querySelectorAll("[data-edgescope]").forEach(b => {
     b.classList.toggle("btn-on", b.dataset.edgescope === edgeScope);
@@ -2192,6 +2478,9 @@ document.querySelectorAll("[data-modview]").forEach(b =>
 document.querySelectorAll("[data-overlay]").forEach(b =>
   b.addEventListener("click", () => { overlay = b.dataset.overlay; refreshAll(false); })
 );
+document.querySelectorAll("[data-density]").forEach(b =>
+  b.addEventListener("click", () => { densityMode = b.dataset.density; refreshAll(true); })
+);
 document.querySelectorAll("[data-edgescope]").forEach(b =>
   b.addEventListener("click", () => { edgeScope = b.dataset.edgescope; refreshAll(false); })
 );
@@ -2249,6 +2538,7 @@ $("zoom-center-btn").addEventListener("click", () => {
   if (activeId) centerOnNode(activeId);
 });
 $("minimap-toggle").addEventListener("click", () => {
+  minimapUserSet = true;
   minimapOpen = !minimapOpen;
   renderMinimap(level === "functions" ? picked.functions : picked[level]);
 });
@@ -2361,7 +2651,22 @@ window.addEventListener("mousemove", ev => {
   if (mmDragging) panFromMinimap(ev);
 });
 
+if (typeof ResizeObserver !== "undefined") {
+  let rsRaf = 0;
+  const ro = new ResizeObserver(() => {
+    if (rsRaf) cancelAnimationFrame(rsRaf);
+    rsRaf = requestAnimationFrame(() => updateMinimapViewport());
+  });
+  ro.observe(vp);
+}
+
 readHash();
+if (!location.hash && DATA.profile && DATA.profile.recommended_level) {
+  const rec = DATA.profile.recommended_level;
+  if (rec === "modules" && DATA.modules.length) level = "modules";
+  else if (rec === "packages" && DATA.packages.length) level = "packages";
+  else level = "blocks";
+}
 renderHeader();
 renderDiagnosis();
 refreshAll(true);

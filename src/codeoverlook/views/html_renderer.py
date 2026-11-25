@@ -67,6 +67,7 @@ def render_atlas_html(
         <div>
           <div class="row" style="margin-bottom:6px;">
             <span class="pill pill-strong" id="pill-repo"></span>
+            <span class="pill pill-scale" id="pill-scale"></span>
             <span class="pill" id="pill-tests"></span>
           </div>
           <h1>CodeOverlook Coverage &amp; Architecture Inspector</h1>
@@ -148,6 +149,12 @@ def render_atlas_html(
                 </button>
                 <button class="btn btn-sm" data-overlay="coverage" type="button">Coverage</button>
                 <button class="btn btn-sm" data-overlay="security" type="button">Security</button>
+              </div>
+              <div id="density-toggle-group" class="seg">
+                <button class="btn btn-sm" data-density="auto" type="button">Auto</button>
+                <button class="btn btn-sm" data-density="compact" type="button">Compact</button>
+                <button class="btn btn-sm" data-density="balanced" type="button">Balanced</button>
+                <button class="btn btn-sm" data-density="detailed" type="button">Detailed</button>
               </div>
               <div id="edge-scope-group" class="seg">
                 <button class="btn btn-sm" data-edgescope="focus" type="button">Focus</button>
