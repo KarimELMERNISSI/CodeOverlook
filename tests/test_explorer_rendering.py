@@ -45,8 +45,10 @@ def test_module_docstring_and_explorer_catalog(sample_repo: Path) -> None:
     assert "ValueError" not in svc["external_libs"]
     assert "ValueError" not in catalog["block_external_libs"].get("engine", [])
 
-    # Symbol call graph captures real intra-module/intra-block calls.
+    # Symbol call graph captures real intra-module/intra-block calls and totals.
     eng_graph = catalog["symbol_graph"]["by_block"]["engine"]
+    assert eng_graph["total_symbols"] >= len(eng_graph["symbols"]) >= 1
+    assert isinstance(catalog["symbol_graph"]["cross_edges"], list)
     eng_edges = {(e["u"], e["v"]) for e in eng_graph["edges"]}
     assert (
         "engine/service.py::run_report",
@@ -55,7 +57,7 @@ def test_module_docstring_and_explorer_catalog(sample_repo: Path) -> None:
 
     db_mod = mods["storage/db.py"]
     assert any(f["rule_id"] == "SINK-SQL-01" for f in db_mod["findings"])
-    assert any(f["rule_id"] == "SINK-SQL-01" for f in catalog["all_findings"])
+    assert any(f["rule_id"] == "SINK-SQL-01" and "symbol_id" in f for f in catalog["all_findings"])
 
 
 def test_python_ast_ingester_truncates_long_module_docstring(tmp_path: Path) -> None:
@@ -100,6 +102,8 @@ def test_explorer_layout_levels_bands_and_violations(sample_repo: Path) -> None:
     assert model["summary"]["blocks_count"] == 3
     assert model["summary"]["violations_count"] >= 1
     assert len(model["bands"]) >= 2
+    assert all("prod_loc" in band and "avg_coverage_pct" in band for band in model["bands"])
+    assert "cross_edges" in model["symbol_graph"]
 
     blocks_by_id = {b["id"]: b for b in model["blocks"]}
     # `ui` depends on `engine` and `storage`, so `ui` sits in L1 above `storage`.
@@ -139,8 +143,17 @@ def test_html_explorer_and_workbench_render_controls_and_fullscreen(sample_repo:
     assert 'id="diag-card"' in full_html
     assert 'id="feature-chips"' in full_html
     assert 'data-overlay="weaknesses"' in full_html
+    assert 'data-edgescope="hop2"' in full_html
+    assert 'id="quick-jump-input"' in full_html
+    assert 'id="minimap-box"' in full_html
+    assert 'id="hover-popover"' in full_html
+    assert 'id="zoom-center-btn"' in full_html
     assert "handleDoubleClickNode" in full_html
     assert "openFunctionsView" in full_html
+    assert "orderNodesInBands" in full_html
+    assert "computeEdgePaths" in full_html
+    assert "renderModulesSvg" in full_html
+    assert "centerOnNode" in full_html
     assert "Tooling &amp; Scripts" in full_html or "Tooling & Scripts" in full_html
     assert "IMPORTS FLOW DOWN" in full_html
     assert "Packages &amp; Bricks" in full_html or "Packages & Bricks" in full_html
