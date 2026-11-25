@@ -86,3 +86,7 @@ from = "ui"
 to = "storage"
 reason = "UI must go through engine rather than importing storage directly."
 ```
+
+## Checks and Vulnerability Referentiel
+
+See [docs/CHECKS_REFERENTIEL.md](docs/CHECKS_REFERENTIEL.md) for the exact catalog of implemented AST sink rules (`SINK-*`), parse integrity checks (`PARSE-SYNTAX-ERR`), architectural weakness diagnostics (`VIOLATION`, `CYCLE`, `BACK-EDGE`, `HIGH BLAST RADIUS`, `GOD MODULE`, `UNTESTED SINKS`, `TOOLING` quarantine), test-gap scoring formulas, built-in safety guards, and current scope limits.
