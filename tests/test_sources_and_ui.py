@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
+import stat
 import subprocess
 import threading
 import urllib.error
@@ -19,6 +21,8 @@ from codeoverlook.core.sources import (
     GitHubSpec,
     SourceResolutionError,
     TargetResolver,
+    _safe_replace_dir,
+    _safe_rmtree,
     parse_github_spec,
 )
 from codeoverlook.interfaces.cli import main
@@ -379,3 +383,73 @@ def test_web_workbench_server_local_and_cached_github(
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_windows_cache_cleanup_and_replace_resilience(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify read-only `.git` cleanup, rename retries, and copy fallback on PermissionError."""
+    ro_dir = tmp_path / "readonly_tree"
+    pack_dir = ro_dir / ".git" / "objects" / "pack"
+    pack_dir.mkdir(parents=True)
+    ro_file = pack_dir / "pack-test.idx"
+    ro_file.write_text("pack", encoding="utf-8")
+    os.chmod(ro_file, stat.S_IREAD)
+
+    _safe_rmtree(ro_dir)
+    assert not ro_dir.exists()
+
+    # Transient PermissionError recovers via retry.
+    src_retry = tmp_path / "staging_retry"
+    dst_retry = tmp_path / "dst_retry"
+    src_retry.mkdir()
+    (src_retry / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+    monkeypatch.setattr("codeoverlook.core.sources.time.sleep", lambda _s: None)
+    real_rename = os.rename
+    attempts = {"count": 0}
+
+    def flaky_rename(s: Path, d: Path) -> None:
+        attempts["count"] += 1
+        if attempts["count"] <= 2:
+            raise PermissionError(5, "Access is denied")
+        real_rename(s, d)
+
+    monkeypatch.setattr("codeoverlook.core.sources.os.rename", flaky_rename)
+    _safe_replace_dir(src_retry, dst_retry)
+    assert attempts["count"] == 3
+    assert (dst_retry / "app.py").is_file()
+
+    # Persistent PermissionError falls back to copying without `.git`.
+    src_fallback = tmp_path / "staging_fallback"
+    dst_fallback = tmp_path / "dst_fallback"
+    (src_fallback / ".git").mkdir(parents=True)
+    (src_fallback / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (src_fallback / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    def always_denied(_s: Path, _d: Path) -> None:
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr("codeoverlook.core.sources.os.rename", always_denied)
+    _safe_replace_dir(src_fallback, dst_fallback)
+    assert (dst_fallback / "main.py").is_file()
+    assert not (dst_fallback / ".git").exists()
+
+    # `_clone_via_git` disables fsmonitor to avoid background file locks on Windows.
+    captured_cmds: list[list[str]] = []
+    monkeypatch.setattr("codeoverlook.core.sources.shutil.which", lambda _n: "git")
+
+    def fake_clone(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured_cmds.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("codeoverlook.core.sources.subprocess.run", fake_clone)
+    ok, _err = TargetResolver._clone_via_git(
+        "https://github.com/acme/demo.git",
+        tmp_path / "clone_target",
+        None,
+        None,
+    )
+    assert ok is True
+    assert "core.fsmonitor=false" in captured_cmds[0]

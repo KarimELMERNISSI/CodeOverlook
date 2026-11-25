@@ -8,12 +8,15 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -221,6 +224,63 @@ def _scrub_secret(text: str, secret: str | None) -> str:
     return text.replace(secret, "***").replace(b64, "***")
 
 
+def _handle_remove_readonly(
+    func: Callable[[str], Any],
+    path: str,
+    _exc: BaseException,
+) -> None:
+    """Clear Windows read-only attribute (e.g. `.git` packfiles) and retry removal."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def _safe_rmtree(path: Path, *, retries: int = 4, ignore_errors: bool = False) -> None:
+    """Remove a directory tree on Windows even when read-only or briefly locked."""
+    if not path.exists():
+        return
+    last_exc: OSError | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            shutil.rmtree(path, onexc=_handle_remove_readonly)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(0.05 * (attempt + 1))
+        except OSError as exc:
+            last_exc = exc
+            break
+    if not ignore_errors and last_exc is not None:
+        raise last_exc
+
+
+def _safe_replace_dir(src: Path, dst: Path) -> None:
+    """Move `src` to `dst` with Windows lock retries and a `.git`-less copy fallback."""
+    backoffs = (0.05, 0.1, 0.2, 0.3, 0.5, 0.8)
+    last_exc: PermissionError | None = None
+    for delay in backoffs:
+        try:
+            os.rename(src, dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(delay)
+
+    # Fallback when AV/indexing keeps a read handle inside `.git` on Windows.
+    try:
+        shutil.copytree(
+            src,
+            dst,
+            ignore=shutil.ignore_patterns(".git"),
+            dirs_exist_ok=True,
+        )
+    except OSError as copy_exc:
+        _safe_rmtree(dst, ignore_errors=True)
+        if last_exc is not None:
+            raise last_exc from copy_exc
+        raise
+    _safe_rmtree(src, ignore_errors=True)
+
+
 def _safe_extract_zipball(archive_bytes: bytes, dest_dir: Path) -> None:
     """Safely extract a GitHub zipball archive, stripping its single top-level directory."""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -364,7 +424,7 @@ class TargetResolver:
         if not git_bin:
             return False, "git binary not found"
 
-        cmd: list[str] = [git_bin]
+        cmd: list[str] = [git_bin, "-c", "core.fsmonitor=false"]
         if token:
             b64 = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
             cmd.extend(
@@ -463,8 +523,7 @@ class TargetResolver:
             if cloned:
                 fetch_method = "git_clone"
             else:
-                if staging_dir.exists():
-                    shutil.rmtree(staging_dir, ignore_errors=True)
+                _safe_rmtree(staging_dir, ignore_errors=True)
                 try:
                     self._download_zipball(spec, staging_dir, ref, token)
                     fetch_method = "zipball"
@@ -476,15 +535,24 @@ class TargetResolver:
 
             self._write_source_meta(staging_dir, spec, ref, fetch_method)
 
-            if checkout_dir.exists():
-                checkout_dir.replace(backup_dir)
-            staging_dir.replace(checkout_dir)
+            try:
+                if checkout_dir.exists():
+                    _safe_replace_dir(checkout_dir, backup_dir)
+                _safe_replace_dir(staging_dir, checkout_dir)
+            except OSError as exc:
+                if backup_dir.exists() and not checkout_dir.exists():
+                    try:
+                        _safe_replace_dir(backup_dir, checkout_dir)
+                    except OSError:
+                        pass
+                raise SourceResolutionError(
+                    f"Unable to store cached repository '{spec.full_name}' at "
+                    f"'{checkout_dir}': {exc}"
+                ) from exc
             return fetch_method
         finally:
-            if staging_dir.exists():
-                shutil.rmtree(staging_dir, ignore_errors=True)
-            if backup_dir.exists():
-                shutil.rmtree(backup_dir, ignore_errors=True)
+            _safe_rmtree(staging_dir, ignore_errors=True)
+            _safe_rmtree(backup_dir, ignore_errors=True)
 
     def resolve(
         self,
