@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from codeoverlook.core.architecture import analyze_architecture
 from codeoverlook.core.blocks import (
     DEFAULT_TEST_PATTERNS,
     ArchConstraint,
@@ -49,6 +50,7 @@ from codeoverlook.core.store import (
 __all__ = [
     "ArchConstraint",
     "BlockConfig",
+    "analyze_architecture",
     "BlockCoverageSummary",
     "BlockResolver",
     "BlockRule",
