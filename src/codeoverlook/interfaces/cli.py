@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sqlite3
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
 from codeoverlook.core.coverage import TestCoverageAnalyzer
 from codeoverlook.core.inspector import (
+    ProgressCallback,
+    ProgressEvent,
     get_db_path,
     load_inspection_snapshot,
     scan_repository,
@@ -79,17 +83,46 @@ def _add_source_args(parser: argparse.ArgumentParser, *, include_refresh: bool =
         )
 
 
+def _make_tty_progress_printer() -> tuple[
+    ProgressCallback | None,
+    Callable[[], None],
+]:
+    if not sys.stderr.isatty():
+        return None, lambda: None
+
+    width = max(40, min(100, shutil.get_terminal_size((80, 20)).columns - 1))
+
+    def _on_progress(event: ProgressEvent) -> None:
+        bar_len = 20
+        filled = int((max(0, min(100, event.percent)) / 100) * bar_len)
+        bar = "#" * filled + "-" * (bar_len - filled)
+        line = f"[{bar}] {event.percent:3d}% {event.message}"
+        sys.stderr.write("\r" + line[:width].ljust(width))
+        sys.stderr.flush()
+
+    def _clear() -> None:
+        sys.stderr.write("\r" + (" " * width) + "\r")
+        sys.stderr.flush()
+
+    return _on_progress, _clear
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     """Index (or incrementally update) a local or GitHub Python repository."""
     target = _resolve_target_from_args(args)
     if target is None:
         return 1
 
-    summary = scan_repository(
-        target,
-        force=bool(args.force),
-        warning_handler=lambda msg: print(f"Warning: {msg}", file=sys.stderr),
-    )
+    progress_cb, clear_progress = _make_tty_progress_printer()
+    try:
+        summary = scan_repository(
+            target,
+            force=bool(args.force),
+            warning_handler=lambda msg: print(f"Warning: {msg}", file=sys.stderr),
+            progress_callback=progress_cb,
+        )
+    finally:
+        clear_progress()
     coverage = summary.coverage
     assert coverage is not None
 

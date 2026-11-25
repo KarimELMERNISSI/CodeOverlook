@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from codeoverlook.interfaces.cli import build_parser, main
 from codeoverlook.interfaces.web_server import (
+    InspectionJobRegistry,
     InspectionSessionRegistry,
     WorkbenchApp,
     create_workbench_server,
@@ -11,6 +12,7 @@ from codeoverlook.interfaces.web_server import (
 )
 
 __all__ = [
+    "InspectionJobRegistry",
     "InspectionSessionRegistry",
     "WorkbenchApp",
     "build_parser",

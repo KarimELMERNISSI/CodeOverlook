@@ -113,6 +113,36 @@ _WORKBENCH_CSS = """
     color: var(--bad);
   }
   .status-banner.ok { border-color: var(--primary); }
+  .progress-wrap {
+    flex-basis: 100%; margin-top: 4px; padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+  .progress-head {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 10px; margin-bottom: 6px; font-size: 12px;
+  }
+  .progress-stage {
+    display: inline-block; padding: 1px 7px; border-radius: 999px;
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em;
+    background: var(--accent); color: var(--fg); margin-right: 6px;
+  }
+  .progress-track {
+    width: 100%; height: 8px; border-radius: 999px;
+    background: var(--bg); border: 1px solid var(--border);
+    overflow: hidden; position: relative;
+  }
+  .progress-fill {
+    height: 100%; width: 0%; background: var(--primary);
+    border-radius: 999px; transition: width 160ms ease;
+  }
+  @keyframes wb-indeterminate {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(260%); }
+  }
+  .progress-fill.indeterminate {
+    width: 38% !important;
+    animation: wb-indeterminate 1.15s ease-in-out infinite;
+  }
   .pill {
     display: inline-block; padding: 2px 8px; border-radius: 999px;
     font-size: 11px; font-weight: 700;
@@ -266,6 +296,25 @@ def render_workbench_html(
       Enter a local directory or GitHub repository above, or pick a cached project on the left.
     </div>
     <div id="status-actions"></div>
+    <div id="progress-wrap" class="progress-wrap" style="display:none;">
+      <div class="progress-head">
+        <div>
+          <span id="progress-stage" class="progress-stage">RESOLVING</span>
+          <span id="progress-msg" class="muted">Starting inspection...</span>
+        </div>
+        <div id="progress-metrics" class="muted">0% | 0.0s</div>
+      </div>
+      <div
+        id="progress-track"
+        class="progress-track"
+        role="progressbar"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow="0"
+      >
+        <div id="progress-fill" class="progress-fill indeterminate"></div>
+      </div>
+    </div>
   </div>
 
   <div class="layout">
@@ -370,6 +419,7 @@ const BOOT = {boot_config};
 let activeSession = null;
 let mermaidMode = 'arch';
 let wbFullscreen = false;
+let inspectToken = 0;
 const WB_THEMES = ['system', 'light', 'dark'];
 let wbTheme = 'system';
 
@@ -455,15 +505,77 @@ function inspectCached(repoName, refVal) {{
   runInspect();
 }}
 
+function updateProgressUi(stage, percent, message, elapsedMs) {{
+  const wrap = document.getElementById('progress-wrap');
+  const fill = document.getElementById('progress-fill');
+  const track = document.getElementById('progress-track');
+  const pct = Math.max(0, Math.min(100, Math.round(percent || 0)));
+  wrap.style.display = 'block';
+  document.getElementById('progress-stage').textContent = String(stage || 'working').toUpperCase();
+  document.getElementById('progress-msg').textContent = message || 'Working...';
+  const secs = ((elapsedMs || 0) / 1000).toFixed(1);
+  document.getElementById('progress-metrics').textContent = `${{pct}}% | ${{secs}}s`;
+  track.setAttribute('aria-valuenow', String(pct));
+  if (stage === 'resolving' && pct < 15) {{
+    fill.classList.add('indeterminate');
+  }} else {{
+    fill.classList.remove('indeterminate');
+    fill.style.width = `${{pct}}%`;
+  }}
+}}
+
+function hideProgressUi() {{
+  document.getElementById('progress-wrap').style.display = 'none';
+}}
+
+function applyInspectResult(data) {{
+  activeSession = data;
+  const t = data.target;
+  const s = data.scan;
+  const cov = data.coverage_summary;
+  let pillClass = 'local';
+  let modeLabel = 'LOCAL (OFFLINE)';
+  if (t.source_kind === 'github') {{
+    pillClass = t.from_cache ? 'cached' : 'online';
+    modeLabel = t.from_cache ? 'GITHUB (CACHED OFFLINE)' : 'GITHUB (ONLINE FETCH)';
+  }}
+
+  setStatus(
+    `<span class="pill ${{pillClass}}">${{modeLabel}}</span> `
+    + `<strong>${{esc(t.display_name)}}</strong> `
+    + `<span class="muted">(${{s.elapsed_ms.toFixed(0)}} ms | `
+    + `${{s.indexed_files}} indexed, ${{s.skipped_files}} unchanged, `
+    + `${{s.pruned_files}} pruned | `
+    + `${{cov.blocks_count}} blocks | `
+    + `${{cov.linked_test_files}}/${{cov.total_test_files}} test files | `
+    + `${{data.cycles.length}} cycles | ${{data.violations.length}} violations)</span>`,
+    'ok'
+  );
+
+  document.getElementById('status-actions').innerHTML =
+    `<a class="btn-link secondary small" href="${{esc(data.report_url)}}?download=1">`
+    + `Export Standalone HTML</a>`;
+
+  document.getElementById('explorer-empty').style.display = 'none';
+  document.getElementById('explorer-shell').style.display = 'block';
+  document.getElementById('explorer-frame').src = data.report_url;
+
+  renderMermaid();
+  renderRisks(data.cycles, data.violations);
+  loadCache();
+}}
+
 async function runInspect() {{
   const target = document.getElementById('target-input').value.trim();
   if (!target) return;
 
+  const myToken = ++inspectToken;
   const btn = document.getElementById('inspect-btn');
   btn.disabled = true;
   btn.textContent = 'Inspecting...';
   document.getElementById('status-actions').innerHTML = '';
-  setStatus('Resolving target and running incremental AST scan...', '');
+  setStatus('Inspecting repository...', '');
+  updateProgressUi('resolving', 5, `Resolving '${{target}}'...`, 0);
 
   try {{
     const payload = {{
@@ -474,56 +586,60 @@ async function runInspect() {{
       refresh: document.getElementById('refresh-check').checked,
       force: document.getElementById('force-check').checked
     }};
-    const res = await fetch('/api/inspect', {{
+    const startRes = await fetch('/api/inspect/start', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify(payload)
     }});
-    const data = await res.json();
-    if (!res.ok) {{
-      setStatus('<strong>Error:</strong> ' + esc(data.error || 'Inspection failed'), 'error');
+    const startData = await startRes.json();
+    if (myToken !== inspectToken) return;
+    if (!startRes.ok) {{
+      hideProgressUi();
+      setStatus(
+        '<strong>Error:</strong> ' + esc(startData.error || 'Inspection failed'),
+        'error'
+      );
       return;
     }}
 
-    activeSession = data;
-    const t = data.target;
-    const s = data.scan;
-    const cov = data.coverage_summary;
-    let pillClass = 'local';
-    let modeLabel = 'LOCAL (OFFLINE)';
-    if (t.source_kind === 'github') {{
-      pillClass = t.from_cache ? 'cached' : 'online';
-      modeLabel = t.from_cache ? 'GITHUB (CACHED OFFLINE)' : 'GITHUB (ONLINE FETCH)';
+    while (myToken === inspectToken) {{
+      const jobRes = await fetch(startData.status_url);
+      const job = await jobRes.json();
+      if (myToken !== inspectToken) return;
+      if (!jobRes.ok) {{
+        hideProgressUi();
+        setStatus('<strong>Error:</strong> ' + esc(job.error || 'Job lookup failed'), 'error');
+        return;
+      }}
+
+      if (job.status === 'error') {{
+        hideProgressUi();
+        setStatus('<strong>Error:</strong> ' + esc(job.error || 'Inspection failed'), 'error');
+        return;
+      }}
+
+      updateProgressUi(job.stage, job.percent, job.message, job.elapsed_ms);
+
+      if (job.status === 'done' && job.result) {{
+        updateProgressUi('done', 100, 'Inspection complete.', job.elapsed_ms);
+        applyInspectResult(job.result);
+        setTimeout(() => {{
+          if (myToken === inspectToken) hideProgressUi();
+        }}, 600);
+        return;
+      }}
+
+      await new Promise(resolve => setTimeout(resolve, 150));
     }}
-
-    setStatus(
-      `<span class="pill ${{pillClass}}">${{modeLabel}}</span> `
-      + `<strong>${{esc(t.display_name)}}</strong> `
-      + `<span class="muted">(${{s.elapsed_ms.toFixed(0)}} ms | `
-      + `${{s.indexed_files}} indexed, ${{s.skipped_files}} unchanged, `
-      + `${{s.pruned_files}} pruned | `
-      + `${{cov.blocks_count}} blocks | `
-      + `${{cov.linked_test_files}}/${{cov.total_test_files}} test files | `
-      + `${{data.cycles.length}} cycles | ${{data.violations.length}} violations)</span>`,
-      'ok'
-    );
-
-    document.getElementById('status-actions').innerHTML =
-      `<a class="btn-link secondary small" href="${{esc(data.report_url)}}?download=1">`
-      + `Export Standalone HTML</a>`;
-
-    document.getElementById('explorer-empty').style.display = 'none';
-    document.getElementById('explorer-shell').style.display = 'block';
-    document.getElementById('explorer-frame').src = data.report_url;
-
-    renderMermaid();
-    renderRisks(data.cycles, data.violations);
-    loadCache();
   }} catch (err) {{
+    if (myToken !== inspectToken) return;
+    hideProgressUi();
     setStatus('<strong>Error:</strong> ' + esc(err), 'error');
   }} finally {{
-    btn.disabled = false;
-    btn.textContent = 'Inspect';
+    if (myToken === inspectToken) {{
+      btn.disabled = false;
+      btn.textContent = 'Inspect';
+    }}
   }}
 }}
 

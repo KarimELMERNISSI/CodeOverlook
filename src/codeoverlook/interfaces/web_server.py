@@ -5,19 +5,22 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 import urllib.parse
 import uuid
 import webbrowser
 from collections import OrderedDict
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from codeoverlook import __version__
 from codeoverlook.core.inspector import (
     InspectionSnapshot,
+    ProgressCallback,
+    ProgressEvent,
     inspect_target,
     slice_repository_target,
 )
@@ -59,6 +62,135 @@ class InspectionSessionRegistry:
             return snapshot
 
 
+@dataclass(slots=True)
+class InspectionJob:
+    """Mutable state for an asynchronous web-workbench inspection job."""
+
+    job_id: str
+    status: Literal["running", "done", "error"]
+    stage: str
+    percent: int
+    message: str
+    current: int
+    total: int
+    started_at: float
+    finished_at: float | None = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    http_status: int = 200
+
+
+class InspectionJobRegistry:
+    """Thread-safe bounded registry tracking background inspection progress."""
+
+    def __init__(self, max_jobs: int = 32) -> None:
+        self._max_jobs = max(1, max_jobs)
+        self._lock = threading.Lock()
+        self._jobs: OrderedDict[str, InspectionJob] = OrderedDict()
+
+    def create(self, message: str = "Starting inspection...") -> str:
+        """Register a new running job and return its ID."""
+        job_id = uuid.uuid4().hex[:16]
+        with self._lock:
+            self._jobs[job_id] = InspectionJob(
+                job_id=job_id,
+                status="running",
+                stage="resolving",
+                percent=0,
+                message=message,
+                current=0,
+                total=0,
+                started_at=time.perf_counter(),
+            )
+            self._jobs.move_to_end(job_id)
+            while len(self._jobs) > self._max_jobs:
+                self._jobs.popitem(last=False)
+        return job_id
+
+    def update_progress(self, job_id: str, event: ProgressEvent) -> None:
+        """Apply a `ProgressEvent` update if the job is still running."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != "running":
+                return
+            job.stage = event.stage
+            job.percent = max(0, min(100, event.percent))
+            job.message = event.message
+            job.current = event.current
+            job.total = event.total
+
+    def complete(self, job_id: str, result: dict[str, Any]) -> None:
+        """Mark a job complete and attach its inspection result payload."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            job.status = "done"
+            job.stage = "done"
+            job.percent = 100
+            job.message = "Inspection complete."
+            job.finished_at = time.perf_counter()
+            job.result = result
+            job.http_status = 200
+
+    def fail(self, job_id: str, error: str, http_status: int = 400) -> None:
+        """Mark a job failed with an error message and HTTP status code."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            job.status = "error"
+            job.stage = "error"
+            job.finished_at = time.perf_counter()
+            job.error = error
+            job.http_status = http_status
+
+    def get_payload(self, job_id: str) -> dict[str, Any] | None:
+        """Return a JSON-serializable snapshot of `job_id`, or `None` if unknown."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            end_ts = job.finished_at if job.finished_at is not None else time.perf_counter()
+            elapsed_ms = round((end_ts - job.started_at) * 1000, 1)
+            return {
+                "job_id": job.job_id,
+                "status": job.status,
+                "stage": job.stage,
+                "percent": job.percent,
+                "message": job.message,
+                "current": job.current,
+                "total": job.total,
+                "elapsed_ms": elapsed_ms,
+                "http_status": job.http_status,
+                "result": job.result,
+                "error": job.error,
+            }
+
+
+def _validate_inspect_body(
+    body: dict[str, Any],
+) -> tuple[str, str | None, str | None, str | None, bool, bool, bool]:
+    raw_target = body.get("target")
+    if not isinstance(raw_target, str) or not raw_target.strip():
+        raise ValueError("Field 'target' must be a non-empty string.")
+
+    ref = body.get("ref")
+    if ref is not None and not isinstance(ref, str):
+        raise ValueError("Field 'ref' must be a string or null.")
+    subpath = body.get("subpath")
+    if subpath is not None and not isinstance(subpath, str):
+        raise ValueError("Field 'subpath' must be a string or null.")
+    token = body.get("token")
+    if token is not None and not isinstance(token, str):
+        raise ValueError("Field 'token' must be a string or null.")
+
+    offline = bool(body.get("offline", False))
+    refresh = bool(body.get("refresh", False))
+    force_scan = bool(body.get("force", False))
+    return raw_target, ref, subpath, token, offline, refresh, force_scan
+
+
 class WorkbenchApp:
     """Application state shared across HTTP workbench request handler threads."""
 
@@ -69,9 +201,11 @@ class WorkbenchApp:
         initial_target: str | None = None,
         offline_default: bool = False,
         max_sessions: int = 16,
+        max_jobs: int = 32,
     ) -> None:
         self.resolver = resolver or TargetResolver()
         self.registry = InspectionSessionRegistry(max_sessions=max_sessions)
+        self.jobs = InspectionJobRegistry(max_jobs=max_jobs)
         self.initial_target = initial_target
         self.offline_default = offline_default
 
@@ -94,25 +228,14 @@ class WorkbenchApp:
             ],
         }
 
-    def inspect_payload(self, body: dict[str, Any]) -> dict[str, Any]:
+    def inspect_payload(
+        self,
+        body: dict[str, Any],
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
         """Execute repository resolution + scan and return workbench JSON payload."""
-        raw_target = body.get("target")
-        if not isinstance(raw_target, str) or not raw_target.strip():
-            raise ValueError("Field 'target' must be a non-empty string.")
-
-        ref = body.get("ref")
-        if ref is not None and not isinstance(ref, str):
-            raise ValueError("Field 'ref' must be a string or null.")
-        subpath = body.get("subpath")
-        if subpath is not None and not isinstance(subpath, str):
-            raise ValueError("Field 'subpath' must be a string or null.")
-        token = body.get("token")
-        if token is not None and not isinstance(token, str):
-            raise ValueError("Field 'token' must be a string or null.")
-
-        offline = bool(body.get("offline", False))
-        refresh = bool(body.get("refresh", False))
-        force_scan = bool(body.get("force", False))
+        raw_target, ref, subpath, token, offline, refresh, force_scan = _validate_inspect_body(body)
 
         resolved, scan_summary, snapshot = inspect_target(
             raw_target,
@@ -123,6 +246,7 @@ class WorkbenchApp:
             force_scan=force_scan,
             token=token,
             resolver=self.resolver,
+            progress_callback=progress_callback,
         )
         session_id = self.registry.put(snapshot)
         mermaid_arch = render_block_mermaid(snapshot.block_summary, snapshot.dependencies)
@@ -164,6 +288,30 @@ class WorkbenchApp:
             "mermaid_arch": mermaid_arch,
             "mermaid_coverage": mermaid_cov,
         }
+
+    def start_inspect_job(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Validate request body and start an asynchronous inspection job."""
+        _validate_inspect_body(body)
+        payload_copy = dict(body)
+        job_id = self.jobs.create()
+
+        def _worker() -> None:
+            try:
+                result = self.inspect_payload(
+                    payload_copy,
+                    progress_callback=lambda ev: self.jobs.update_progress(job_id, ev),
+                )
+                self.jobs.complete(job_id, result)
+            except (SourceResolutionError, ValueError) as exc:
+                self.jobs.fail(job_id, str(exc), http_status=400)
+            except FileNotFoundError as exc:
+                self.jobs.fail(job_id, str(exc), http_status=404)
+            except (sqlite3.Error, OSError) as exc:
+                self.jobs.fail(job_id, str(exc), http_status=500)
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        return {"job_id": job_id, "status_url": f"/api/jobs/{job_id}"}
 
     def slice_payload(self, body: dict[str, Any]) -> dict[str, Any]:
         """Run `ContextSlicer` for an active workbench session."""
@@ -274,6 +422,19 @@ def _make_handler(app: WorkbenchApp) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.OK, app.list_cache_payload())
                 return
 
+            if path.startswith("/api/jobs/"):
+                parts = [p for p in path.split("/") if p]
+                if len(parts) == 3 and parts[0] == "api" and parts[1] == "jobs":
+                    job_payload = app.jobs.get_payload(parts[2])
+                    if job_payload is None:
+                        self._send_json(
+                            HTTPStatus.NOT_FOUND,
+                            {"error": f"Unknown or expired inspection job '{parts[2]}'."},
+                        )
+                        return
+                    self._send_json(HTTPStatus.OK, job_payload)
+                    return
+
             if path.startswith("/api/report/") and path.endswith("/html"):
                 parts = [p for p in path.split("/") if p]
                 if len(parts) == 4 and parts[0] == "api" and parts[1] == "report":
@@ -301,6 +462,9 @@ def _make_handler(app: WorkbenchApp) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json_body()
                 if path == "/api/inspect":
                     self._send_json(HTTPStatus.OK, app.inspect_payload(body))
+                    return
+                if path == "/api/inspect/start":
+                    self._send_json(HTTPStatus.ACCEPTED, app.start_inspect_job(body))
                     return
                 if path == "/api/slice":
                     self._send_json(HTTPStatus.OK, app.slice_payload(body))
