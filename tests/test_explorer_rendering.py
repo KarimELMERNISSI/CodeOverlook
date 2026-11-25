@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from codeoverlook.core.architecture import analyze_architecture
 from codeoverlook.core.blocks import BlockResolver
 from codeoverlook.core.coverage import TestCoverageAnalyzer
 from codeoverlook.core.store import FactStore
@@ -16,10 +17,12 @@ from codeoverlook.views.workbench import render_workbench_html
 
 
 def test_module_docstring_and_explorer_catalog(sample_repo: Path) -> None:
-    """Extract module docstrings into SQLite and assemble rich explorer catalog facts."""
+    """Extract module docstrings, symbol call graphs, and clean external imports."""
     (sample_repo / "engine" / "service.py").write_text(
         '"""Core reporting service orchestrating summaries and storage lookups."""\n\n'
-        + (sample_repo / "engine" / "service.py").read_text(encoding="utf-8"),
+        "import pandas as pd\n\n"
+        + (sample_repo / "engine" / "service.py").read_text(encoding="utf-8")
+        + "\ndef helper_calls_error() -> None:\n    raise ValueError('bad')\n",
         encoding="utf-8",
     )
 
@@ -36,6 +39,19 @@ def test_module_docstring_and_explorer_catalog(sample_repo: Path) -> None:
     assert "ui/view.py" in svc["imported_by"]
     assert "tests/test_engine.py" in svc["test_files"]
     assert any(s["name"] == "ReportBuilder" for s in svc["symbols"])
+
+    # External libs must include real external imports only, never builtins like ValueError.
+    assert "pandas" in svc["external_libs"]
+    assert "ValueError" not in svc["external_libs"]
+    assert "ValueError" not in catalog["block_external_libs"].get("engine", [])
+
+    # Symbol call graph captures real intra-module/intra-block calls.
+    eng_graph = catalog["symbol_graph"]["by_block"]["engine"]
+    eng_edges = {(e["u"], e["v"]) for e in eng_graph["edges"]}
+    assert (
+        "engine/service.py::run_report",
+        "engine/service.py::ReportBuilder.build_summary",
+    ) in eng_edges
 
     db_mod = mods["storage/db.py"]
     assert any(f["rule_id"] == "SINK-SQL-01" for f in db_mod["findings"])
@@ -119,6 +135,13 @@ def test_html_explorer_and_workbench_render_controls_and_fullscreen(sample_repo:
     assert 'id="theme-btn"' in full_html
     assert 'id="fs-btn"' in full_html
     assert 'id="zoom-fit-btn"' in full_html
+    assert 'id="breadcrumbs"' in full_html
+    assert 'id="diag-card"' in full_html
+    assert 'id="feature-chips"' in full_html
+    assert 'data-overlay="weaknesses"' in full_html
+    assert "handleDoubleClickNode" in full_html
+    assert "openFunctionsView" in full_html
+    assert "Tooling &amp; Scripts" in full_html or "Tooling & Scripts" in full_html
     assert "IMPORTS FLOW DOWN" in full_html
     assert "Packages &amp; Bricks" in full_html or "Packages & Bricks" in full_html
     assert "SINK-SQL-01" in full_html
@@ -140,3 +163,88 @@ def test_html_explorer_and_workbench_render_controls_and_fullscreen(sample_repo:
     assert "allowfullscreen" in wb_html
     assert "toggleExplorerFullscreen" in wb_html
     assert json.dumps(str(sample_repo)) in wb_html
+
+
+def test_semantic_architecture_analyzer_layers_tooling_and_weaknesses() -> None:
+    """Verify semantic roles, tooling quarantine, SCC cycles, God modules, and features."""
+    blocks = [
+        {
+            "id": "ui",
+            "prod_files": 4,
+            "prod_loc": 800,
+            "file_coverage_pct": 80.0,
+            "sensitive_sinks": 0,
+            "untested_sinks": 0,
+            "external_libs": ["streamlit"],
+        },
+        {
+            "id": "service",
+            "prod_files": 5,
+            "prod_loc": 1200,
+            "file_coverage_pct": 50.0,
+            "sensitive_sinks": 2,
+            "untested_sinks": 1,
+            "external_libs": ["requests"],
+        },
+        {
+            "id": "core",
+            "prod_files": 6,
+            "prod_loc": 2400,
+            "file_coverage_pct": 40.0,
+            "sensitive_sinks": 0,
+            "untested_sinks": 0,
+            "external_libs": ["numpy"],
+        },
+        {
+            "id": "dev_scripts",
+            "prod_files": 3,
+            "prod_loc": 300,
+            "file_coverage_pct": 0.0,
+            "sensitive_sinks": 1,
+            "untested_sinks": 1,
+            "external_libs": [],
+        },
+    ]
+    edges = [
+        {"u": "ui", "v": "service", "n": 3, "violation": False, "reason": ""},
+        {"u": "service", "v": "core", "n": 4, "violation": False, "reason": ""},
+        # Upward back-edge creating a cycle between service and core
+        {"u": "core", "v": "service", "n": 1, "violation": False, "reason": ""},
+        {"u": "dev_scripts", "v": "core", "n": 1, "violation": False, "reason": ""},
+    ]
+    modules = [
+        {
+            "path": "core/mega.py",
+            "block_id": "core",
+            "loc": 620,
+            "imports": ["a.py", "b.py", "c.py"],
+            "imported_by": ["x.py", "y.py", "z.py"],
+            "sinks": 1,
+            "tested": False,
+        }
+    ]
+    arch = analyze_architecture(
+        blocks_payload=blocks,
+        block_edges=edges,
+        packages_payload=[
+            {"id": "ui::ui", "block_id": "ui"},
+            {"id": "service::service", "block_id": "service"},
+        ],
+        modules_payload=modules,
+        cycles=[["service/a.py", "core/mega.py", "service/a.py"]],
+        violations=[],
+    )
+
+    assert arch["tooling_blocks"] == ["dev_scripts"]
+    bm = arch["block_metrics"]
+    assert bm["dev_scripts"]["zone"] == "tooling"
+    assert bm["ui"]["role"] == "interface"
+    assert bm["ui"]["band"] == "L1"
+    assert "CYCLE" in bm["service"]["weakness_tags"]
+    assert "GOD MODULE" in bm["core"]["weakness_tags"]
+    assert len(arch["god_modules"]) == 1
+    assert arch["god_modules"][0]["path"] == "core/mega.py"
+    assert len(arch["features"]) >= 1
+    assert any(d["kind"] == "CYCLE" for d in arch["diagnosis"])
+    assert any(d["kind"] == "GOD-MODULE" for d in arch["diagnosis"])
+    assert any(d["kind"] == "TOOLING" for d in arch["diagnosis"])
