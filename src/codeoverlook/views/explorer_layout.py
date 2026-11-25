@@ -72,8 +72,14 @@ def build_explorer_model(
     block_ext_libs = dict((catalog or {}).get("block_external_libs", {}))
     all_findings = list((catalog or {}).get("all_findings", []))
     symbol_graph = dict(
-        (catalog or {}).get("symbol_graph", {"by_module": {}, "by_block": {}})
+        (catalog or {}).get(
+            "symbol_graph",
+            {"by_module": {}, "by_block": {}, "cross_edges": []},
+        )
     )
+    symbol_graph.setdefault("by_module", {})
+    symbol_graph.setdefault("by_block", {})
+    symbol_graph.setdefault("cross_edges", [])
 
     modules_by_block: dict[str, list[dict[str, Any]]] = defaultdict(list)
     modules_by_pkg: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -219,6 +225,7 @@ def build_explorer_model(
                 "imported_by": sorted(set(block_imported_by.get(blk.block_id, []))),
                 "external_libs": block_ext_libs.get(blk.block_id, []),
                 "packages": blk_pkgs,
+                "packages_count": len(blk_pkgs),
                 "linked_tests": linked_tests,
                 "gaps": gaps,
                 "findings": blk_findings,
@@ -263,7 +270,7 @@ def build_explorer_model(
         mod["band"] = bm.get("band", "L1")
         mod["zone"] = bm.get("zone", "production")
 
-    bands = arch["bands"]
+    bands = [dict(band) for band in arch["bands"]]
     if not bands:
         bands = [
             {
@@ -274,6 +281,20 @@ def build_explorer_model(
                 "desc": "Primary module grouping",
             }
         ]
+
+    for band in bands:
+        bid = str(band["id"])
+        members = [
+            b for b in blocks_payload if b.get("zone") != "tooling" and b.get("band") == bid
+        ]
+        b_files = sum(int(m.get("prod_files", 0)) for m in members)
+        b_tested = sum(int(m.get("tested_files", 0)) for m in members)
+        band["blocks_count"] = len(members)
+        band["prod_files"] = b_files
+        band["prod_loc"] = sum(int(m.get("prod_loc", 0)) for m in members)
+        band["avg_coverage_pct"] = round((b_tested / max(1, b_files)) * 100.0, 1)
+        band["sensitive_sinks"] = sum(int(m.get("sensitive_sinks", 0)) for m in members)
+        band["untested_sinks"] = sum(int(m.get("untested_sinks", 0)) for m in members)
 
     total_prod_files = sum(b.prod_files for b in coverage.blocks)
     total_tested_files = sum(b.tested_files for b in coverage.blocks)

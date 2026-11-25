@@ -661,7 +661,7 @@ class FactStore:
         symbols_by_block: dict[str, list[str]] = defaultdict(list)
         for row in self.conn.execute(
             """
-            SELECT id, file_path, kind, name, qualname, signature, start_line, end_line
+            SELECT id, file_path, kind, name, qualname, signature, start_line, end_line, docstring
             FROM symbols
             WHERE kind != 'module'
             ORDER BY file_path ASC, start_line ASC;
@@ -674,6 +674,11 @@ class FactStore:
             blk = prod_files[fp][0]
             sig_raw = str(row["signature"])
             sig_short = sig_raw if len(sig_raw) <= 96 else (sig_raw[:93] + "...")
+            raw_doc = str(row["docstring"] or "").strip()
+            first_doc = ""
+            if raw_doc:
+                first_line = " ".join(raw_doc.splitlines()[0].split())
+                first_doc = first_line if len(first_line) <= 110 else (first_line[:107] + "...")
             prod_symbols[sid] = {
                 "id": sid,
                 "name": str(row["name"]),
@@ -684,6 +689,7 @@ class FactStore:
                 "line": int(row["start_line"]),
                 "end_line": int(row["end_line"]),
                 "signature": sig_short,
+                "doc": first_doc,
                 "tested": False,
                 "sinks": 0,
                 "degree": 0,
@@ -759,6 +765,7 @@ class FactStore:
             item = {
                 "file_path": fp,
                 "block_id": prod_files[fp][0],
+                "symbol_id": str(sid) if sid else "",
                 "rule_id": str(row["rule_id"]),
                 "severity": str(row["severity"]),
                 "category": str(row["category"]),
@@ -786,18 +793,36 @@ class FactStore:
             ]
             # Sort back into file + line order for clean swimlane rendering.
             ranked.sort(key=lambda s: (str(s["file_path"]), int(s["line"])))
-            return {"symbols": ranked, "edges": packed_edges}
+            return {
+                "symbols": ranked,
+                "edges": packed_edges,
+                "total_symbols": len(candidate_ids),
+            }
 
         by_module_graph = {
-            fp: _pack_symbol_subgraph(sids, 10)
+            fp: _pack_symbol_subgraph(sids, 16)
             for fp, sids in symbols_by_file.items()
             if sids
         }
         by_block_graph = {
-            blk: _pack_symbol_subgraph(sids, 24)
+            blk: _pack_symbol_subgraph(sids, 36)
             for blk, sids in symbols_by_block.items()
             if sids
         }
+        kept_mod_sym_ids = {
+            s["id"]
+            for sub in by_module_graph.values()
+            for s in sub["symbols"]
+        }
+        cross_edges = [
+            {"u": u, "v": v, "kind": k, "w": w}
+            for u, v, k, w in sorted(sym_edges, key=lambda edge: (-edge[3], edge[0], edge[1]))
+            if (
+                u in kept_mod_sym_ids
+                and v in kept_mod_sym_ids
+                and self._file_from_node(u) != self._file_from_node(v)
+            )
+        ][:600]
 
         modules: list[dict[str, Any]] = []
         for path, (block_id, loc) in prod_files.items():
@@ -825,6 +850,7 @@ class FactStore:
             "symbol_graph": {
                 "by_module": by_module_graph,
                 "by_block": by_block_graph,
+                "cross_edges": cross_edges,
             },
         }
 
