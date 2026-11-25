@@ -9,6 +9,7 @@ import shutil
 import stat
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -17,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from codeoverlook.core.inspector import ProgressEvent, inspect_target
 from codeoverlook.core.sources import (
     GitHubSpec,
     SourceResolutionError,
@@ -27,6 +29,7 @@ from codeoverlook.core.sources import (
 )
 from codeoverlook.interfaces.cli import main
 from codeoverlook.interfaces.web_server import create_workbench_server
+from codeoverlook.views.workbench import render_workbench_html
 
 
 def _zip_from_directory(src_dir: Path, *, root_folder: str = "acme-demo-abc123") -> bytes:
@@ -453,3 +456,84 @@ def test_windows_cache_cleanup_and_replace_resilience(
     )
     assert ok is True
     assert "core.fsmonitor=false" in captured_cmds[0]
+
+
+def test_inspect_progress_events_and_async_workbench_jobs(
+    sample_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """Verify monotonic progress callbacks and async workbench job polling."""
+    events: list[ProgressEvent] = []
+    inspect_target(str(sample_repo), progress_callback=events.append)
+
+    stages = [e.stage for e in events]
+    percents = [e.percent for e in events]
+    assert stages[0] == "resolving"
+    assert "scanning" in stages
+    assert stages[-1] == "done"
+    assert percents[-1] == 100
+    assert percents == sorted(percents)
+
+    wb_html = render_workbench_html()
+    assert 'id="progress-wrap"' in wb_html
+    assert 'role="progressbar"' in wb_html
+    assert "/api/inspect/start" in wb_html
+
+    server = create_workbench_server("127.0.0.1", 0, cache_dir=tmp_path / "cache")
+    port = server.server_address[1]
+    base_url = f"http://127.0.0.1:{port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        # Successful async inspection job reaches `done` with full session result.
+        status, _hdrs, start_body = _http_request(
+            f"{base_url}/api/inspect/start",
+            method="POST",
+            payload={"target": str(sample_repo), "offline": True},
+        )
+        assert status == 202
+        start_data = json.loads(start_body)
+        status_url = f"{base_url}{start_data['status_url']}"
+
+        job_data: dict[str, Any] = {}
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            j_status, _hdrs, j_body = _http_request(status_url)
+            assert j_status == 200
+            job_data = json.loads(j_body)
+            if job_data["status"] in {"done", "error"}:
+                break
+            time.sleep(0.03)
+
+        assert job_data["status"] == "done"
+        assert job_data["percent"] == 100
+        assert job_data["result"]["session_id"]
+        assert job_data["result"]["report_url"].startswith("/api/report/")
+
+        # Failing async inspection job (uncached offline GitHub repo) reports `error`.
+        status, _hdrs, err_start = _http_request(
+            f"{base_url}/api/inspect/start",
+            method="POST",
+            payload={"target": "acme/missing-offline", "offline": True},
+        )
+        assert status == 202
+        err_url = f"{base_url}{json.loads(err_start)['status_url']}"
+
+        err_job: dict[str, Any] = {}
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            j_status, _hdrs, j_body = _http_request(err_url)
+            assert j_status == 200
+            err_job = json.loads(j_body)
+            if err_job["status"] in {"done", "error"}:
+                break
+            time.sleep(0.03)
+
+        assert err_job["status"] == "error"
+        assert err_job["http_status"] == 400
+        assert "not in the offline cache" in err_job["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
