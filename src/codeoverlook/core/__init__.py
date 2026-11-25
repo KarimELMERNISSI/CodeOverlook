@@ -20,6 +20,8 @@ from codeoverlook.core.coverage import (
 )
 from codeoverlook.core.inspector import (
     InspectionSnapshot,
+    ProgressCallback,
+    ProgressEvent,
     ScanSummary,
     get_db_path,
     inspect_target,
@@ -59,6 +61,8 @@ __all__ = [
     "FindingRecord",
     "GitHubSpec",
     "InspectionSnapshot",
+    "ProgressCallback",
+    "ProgressEvent",
     "RepoCoverageReport",
     "ResolvedTarget",
     "ScanSummary",

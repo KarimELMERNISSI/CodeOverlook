@@ -18,6 +18,25 @@ from codeoverlook.ingesters.python_ast import PythonASTIngester
 from codeoverlook.views.html_renderer import render_atlas_html
 
 
+@dataclass(frozen=True, slots=True)
+class ProgressEvent:
+    """Progress snapshot emitted during target resolution, scanning, and rendering."""
+
+    stage: str
+    percent: int
+    message: str
+    current: int = 0
+    total: int = 0
+
+
+ProgressCallback = Callable[[ProgressEvent], None]
+
+
+def _emit(callback: ProgressCallback | None, event: ProgressEvent) -> None:
+    if callback is not None:
+        callback(event)
+
+
 @dataclass(slots=True)
 class ScanSummary:
     """Result metrics produced by indexing a resolved repository."""
@@ -70,6 +89,7 @@ def scan_repository(
     *,
     force: bool = False,
     warning_handler: Callable[[str], None] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> ScanSummary:
     """Index or incrementally update `target` into its SQLite Fact Store.
 
@@ -77,6 +97,7 @@ def scan_repository(
         target: Resolved local or cached GitHub target.
         force: When `True`, re-parse every file regardless of matching `sha256`.
         warning_handler: Optional callback invoked for non-fatal config/read warnings.
+        progress_callback: Optional callback receiving `ProgressEvent` updates.
 
     Returns:
         `ScanSummary` containing scan timings, counts, cycles, violations, and coverage.
@@ -91,21 +112,29 @@ def scan_repository(
         for warning in warnings:
             warning_handler(warning)
 
+    _emit(progress_callback, ProgressEvent("discovering", 18, "Discovering Python files..."))
     ingester = PythonASTIngester(
         repo_root,
         block_resolver=resolver.resolve,
         exclude_checker=resolver.is_excluded,
         test_detector=resolver.is_test_file,
     )
+    py_files = ingester.iter_python_files()
+    total_files = len(py_files)
+    _emit(
+        progress_callback,
+        ProgressEvent("discovering", 22, f"Found {total_files} Python files", 0, total_files),
+    )
 
     skipped = 0
     active_paths: list[str] = []
     parsed_batch: list[FileParseResult] = []
+    emit_step = max(1, total_files // 40)
 
     with FactStore(db_path) as store:
         store.init_schema()
         existing_hashes = store.get_file_hashes()
-        for py_file in ingester.iter_python_files():
+        for idx, py_file in enumerate(py_files, start=1):
             rel = py_file.relative_to(repo_root).as_posix()
             active_paths.append(rel)
             try:
@@ -124,9 +153,42 @@ def scan_repository(
             else:
                 skipped += 1
 
+            if idx == 1 or idx == total_files or idx % emit_step == 0:
+                pct = 22 + int((idx / max(1, total_files)) * 56)
+                _emit(
+                    progress_callback,
+                    ProgressEvent(
+                        "scanning",
+                        pct,
+                        f"Scanning Python files ({idx}/{total_files})...",
+                        idx,
+                        total_files,
+                    ),
+                )
+
+        _emit(
+            progress_callback,
+            ProgressEvent(
+                "storing",
+                80,
+                f"Writing {len(parsed_batch)} parsed files to SQLite...",
+                len(parsed_batch),
+                total_files,
+            ),
+        )
         if parsed_batch:
             store.replace_many_file_facts(parsed_batch)
 
+        _emit(
+            progress_callback,
+            ProgressEvent(
+                "analyzing",
+                88,
+                "Computing dependencies, cycles, and test coverage...",
+                total_files,
+                total_files,
+            ),
+        )
         pruned = store.prune_deleted_files(active_paths)
         blocks = store.get_block_risk_summary()
         deps = store.get_block_dependencies()
@@ -151,11 +213,16 @@ def scan_repository(
     )
 
 
-def load_inspection_snapshot(target: ResolvedTarget) -> InspectionSnapshot:
+def load_inspection_snapshot(
+    target: ResolvedTarget,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> InspectionSnapshot:
     """Load an `InspectionSnapshot` and standalone HTML report from an existing index.
 
     Args:
         target: Resolved repository target whose `.codeoverlook/index.db` already exists.
+        progress_callback: Optional callback receiving `ProgressEvent` updates.
 
     Returns:
         Populated `InspectionSnapshot` ready for CLI output or web workbench rendering.
@@ -175,6 +242,10 @@ def load_inspection_snapshot(target: ResolvedTarget) -> InspectionSnapshot:
         coverage = TestCoverageAnalyzer(store).analyze()
         catalog = store.get_explorer_catalog()
 
+    _emit(
+        progress_callback,
+        ProgressEvent("rendering", 94, "Rendering interactive HTML explorer..."),
+    )
     html_doc = render_atlas_html(
         repo_name=target.display_name,
         coverage=coverage,
@@ -207,6 +278,7 @@ def inspect_target(
     token: str | None = None,
     cache_dir: Path | None = None,
     resolver: TargetResolver | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[ResolvedTarget, ScanSummary, InspectionSnapshot]:
     """Resolve a local or GitHub target, scan it, and return a full inspection snapshot.
 
@@ -220,10 +292,12 @@ def inspect_target(
         token: Optional GitHub access token.
         cache_dir: Optional custom cache directory when `resolver` is not supplied.
         resolver: Optional preconfigured `TargetResolver` instance.
+        progress_callback: Optional callback receiving `ProgressEvent` updates.
 
     Returns:
         Tuple of `(ResolvedTarget, ScanSummary, InspectionSnapshot)`.
     """
+    _emit(progress_callback, ProgressEvent("resolving", 5, f"Resolving target '{raw_target}'..."))
     active_resolver = resolver or TargetResolver(cache_dir=cache_dir)
     resolved = active_resolver.resolve(
         raw_target,
@@ -233,8 +307,18 @@ def inspect_target(
         refresh=refresh,
         token=token,
     )
-    scan_summary = scan_repository(resolved, force=force_scan)
-    snapshot = load_inspection_snapshot(resolved)
+    mode = (
+        "local"
+        if resolved.source_kind == "local"
+        else ("cached offline" if resolved.from_cache else (resolved.fetch_method or "online"))
+    )
+    _emit(
+        progress_callback,
+        ProgressEvent("resolving", 15, f"Resolved {resolved.display_name} ({mode})"),
+    )
+    scan_summary = scan_repository(resolved, force=force_scan, progress_callback=progress_callback)
+    snapshot = load_inspection_snapshot(resolved, progress_callback=progress_callback)
+    _emit(progress_callback, ProgressEvent("done", 100, "Inspection complete."))
     return resolved, scan_summary, snapshot
 
 
