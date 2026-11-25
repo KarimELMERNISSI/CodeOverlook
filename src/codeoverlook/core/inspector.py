@@ -173,6 +173,7 @@ def load_inspection_snapshot(target: ResolvedTarget) -> InspectionSnapshot:
         cycles = store.detect_import_cycles()
         violations = resolver.check_violations(deps)
         coverage = TestCoverageAnalyzer(store).analyze()
+        catalog = store.get_explorer_catalog()
 
     html_doc = render_atlas_html(
         repo_name=target.display_name,
@@ -181,6 +182,7 @@ def load_inspection_snapshot(target: ResolvedTarget) -> InspectionSnapshot:
         dependencies=deps,
         cycles=cycles,
         violations=violations,
+        catalog=catalog,
     )
     return InspectionSnapshot(
         target=target,

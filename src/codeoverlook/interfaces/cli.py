@@ -9,17 +9,16 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from codeoverlook.core.blocks import BlockResolver
 from codeoverlook.core.coverage import TestCoverageAnalyzer
 from codeoverlook.core.inspector import (
     get_db_path,
+    load_inspection_snapshot,
     scan_repository,
     slice_repository_target,
 )
 from codeoverlook.core.sources import ResolvedTarget, SourceResolutionError, TargetResolver
 from codeoverlook.core.store import FactStore
 from codeoverlook.interfaces.web_server import serve_workbench
-from codeoverlook.views.html_renderer import render_atlas_html
 from codeoverlook.views.mermaid import render_block_mermaid, render_coverage_mermaid
 
 
@@ -316,29 +315,14 @@ def cmd_html(args: argparse.Namespace) -> int:
         return 1
 
     repo_root = target.root_path
-    resolver = BlockResolver(repo_root)
-    with FactStore(db_path) as store:
-        summary = store.get_block_risk_summary()
-        deps = store.get_block_dependencies()
-        cycles = store.detect_import_cycles()
-        violations = resolver.check_violations(deps)
-        coverage = TestCoverageAnalyzer(store).analyze()
-
-    html_doc = render_atlas_html(
-        repo_name=target.display_name,
-        coverage=coverage,
-        block_summary=summary,
-        dependencies=deps,
-        cycles=cycles,
-        violations=violations,
-    )
+    snapshot = load_inspection_snapshot(target)
     out_path = (
         Path(args.output).resolve()
         if args.output
         else (repo_root / ".codeoverlook" / "overlook.html")
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(html_doc, encoding="utf-8")
+    out_path.write_text(snapshot.html_doc, encoding="utf-8")
     print(f"HTML explorer generated: {out_path}")
     return 0
 

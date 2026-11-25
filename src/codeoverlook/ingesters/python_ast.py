@@ -316,6 +316,7 @@ class PythonASTIngester:
             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
         }
         fixture_return_types = _extract_fixture_types(tree)
+        module_docstring = _summarize_docstring(ast.get_docstring(tree))
 
         visitor = _ModuleVisitor(
             rel_path=rel_path,
@@ -324,6 +325,7 @@ class PythonASTIngester:
             stdlib_modules=self.stdlib_modules,
             top_level_symbols=top_level_symbols,
             fixture_return_types=fixture_return_types,
+            module_docstring=module_docstring,
         )
         visitor.visit(tree)
 
@@ -337,6 +339,19 @@ class PythonASTIngester:
             edges=visitor.edges,
             findings=visitor.findings,
         )
+
+
+def _summarize_docstring(raw: str | None, max_len: int = 240) -> str | None:
+    """Collapse a module docstring into a single concise summary line."""
+    if not raw:
+        return None
+    first_para = raw.strip().split("\n\n", 1)[0]
+    collapsed = " ".join(first_para.split())
+    if not collapsed:
+        return None
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max_len - 3].rstrip() + "..."
 
 
 def _is_dynamic_sql_expr(expr: ast.expr) -> bool:
@@ -365,6 +380,7 @@ class _ModuleVisitor(ast.NodeVisitor):
         stdlib_modules: set[str],
         top_level_symbols: set[str] | None = None,
         fixture_return_types: dict[str, str] | None = None,
+        module_docstring: str | None = None,
     ) -> None:
         self.rel_path = rel_path
         self.module_name = module_name
@@ -388,7 +404,7 @@ class _ModuleVisitor(ast.NodeVisitor):
                 signature=f"module {module_name or Path(rel_path).stem}",
                 start_line=1,
                 end_line=1,
-                docstring=None,
+                docstring=module_docstring,
             )
         ]
         self.edges: list[EdgeRecord] = []

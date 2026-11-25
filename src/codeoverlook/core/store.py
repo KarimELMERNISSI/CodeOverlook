@@ -579,6 +579,169 @@ class FactStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @staticmethod
+    def _package_name(rel_path: str) -> str:
+        parts = Path(rel_path).parts
+        if len(parts) <= 1:
+            return "root"
+        if parts[0] == "src" and len(parts) >= 4:
+            return f"{parts[1]}/{parts[2]}"
+        if parts[0] == "src" and len(parts) == 3:
+            return parts[1]
+        if len(parts) >= 3:
+            return f"{parts[0]}/{parts[1]}"
+        return parts[0]
+
+    @staticmethod
+    def _file_from_node(node_id: str) -> str:
+        idx = node_id.find("::")
+        return node_id[:idx] if idx != -1 else node_id
+
+    def get_explorer_catalog(self) -> dict[str, Any]:
+        """Build module, external library, and finding details for the HTML explorer."""
+        file_rows = self.conn.execute(
+            "SELECT path, block_id, loc, is_test FROM files ORDER BY path ASC;"
+        ).fetchall()
+        prod_files: dict[str, tuple[str, int]] = {}
+        test_files: set[str] = set()
+        for row in file_rows:
+            path = str(row["path"])
+            if int(row["is_test"]) == 1:
+                test_files.add(path)
+            else:
+                prod_files[path] = (str(row["block_id"]), int(row["loc"]))
+
+        mod_docs: dict[str, str] = {}
+        for row in self.conn.execute(
+            "SELECT file_path, docstring FROM symbols WHERE kind = 'module';"
+        ).fetchall():
+            if row["docstring"]:
+                mod_docs[str(row["file_path"])] = str(row["docstring"])
+
+        symbol_counts: dict[str, int] = defaultdict(int)
+        for row in self.conn.execute(
+            """
+            SELECT file_path, COUNT(*) AS cnt
+            FROM symbols
+            WHERE kind != 'module'
+            GROUP BY file_path;
+            """
+        ).fetchall():
+            symbol_counts[str(row["file_path"])] = int(row["cnt"])
+
+        top_symbols: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in self.conn.execute(
+            """
+            SELECT file_path, name, kind, signature, start_line
+            FROM symbols
+            WHERE kind IN ('class', 'function')
+            ORDER BY file_path ASC, start_line ASC;
+            """
+        ).fetchall():
+            fp = str(row["file_path"])
+            if fp not in prod_files or len(top_symbols[fp]) >= 10:
+                continue
+            top_symbols[fp].append(
+                {
+                    "name": str(row["name"]),
+                    "kind": str(row["kind"]),
+                    "signature": str(row["signature"]),
+                    "start_line": int(row["start_line"]),
+                }
+            )
+
+        mod_imports: dict[str, set[str]] = defaultdict(set)
+        mod_imported_by: dict[str, set[str]] = defaultdict(set)
+        mod_ext_libs: dict[str, set[str]] = defaultdict(set)
+        block_ext_libs: dict[str, set[str]] = defaultdict(set)
+        mod_test_files: dict[str, set[str]] = defaultdict(set)
+
+        for row in self.conn.execute(
+            "SELECT src_id, dst_id, kind, target_scope FROM edges;"
+        ).fetchall():
+            src_file = self._file_from_node(str(row["src_id"]))
+            dst_raw = str(row["dst_id"])
+            scope = str(row["target_scope"])
+            kind = str(row["kind"])
+
+            if scope == "EXTERNAL" and src_file in prod_files:
+                pkg = dst_raw.split(".", 1)[0]
+                if pkg:
+                    mod_ext_libs[src_file].add(pkg)
+                    block_ext_libs[prod_files[src_file][0]].add(pkg)
+            elif scope == "INTERNAL":
+                dst_file = self._file_from_node(dst_raw)
+                if (
+                    kind == "IMPORTS"
+                    and src_file in prod_files
+                    and dst_file in prod_files
+                    and src_file != dst_file
+                ):
+                    mod_imports[src_file].add(dst_file)
+                    mod_imported_by[dst_file].add(src_file)
+                elif src_file in test_files and dst_file in prod_files:
+                    mod_test_files[dst_file].add(src_file)
+
+        mod_findings: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        all_findings: list[dict[str, Any]] = []
+        for row in self.conn.execute(
+            """
+            SELECT file_path, rule_id, severity, category, line, message
+            FROM findings
+            ORDER BY
+                CASE severity
+                    WHEN 'CRITICAL' THEN 1
+                    WHEN 'HIGH' THEN 2
+                    WHEN 'MEDIUM' THEN 3
+                    WHEN 'LOW' THEN 4
+                    ELSE 5
+                END,
+                file_path ASC,
+                line ASC;
+            """
+        ).fetchall():
+            fp = str(row["file_path"])
+            if fp not in prod_files:
+                continue
+            item = {
+                "file_path": fp,
+                "block_id": prod_files[fp][0],
+                "rule_id": str(row["rule_id"]),
+                "severity": str(row["severity"]),
+                "category": str(row["category"]),
+                "line": int(row["line"]),
+                "message": str(row["message"]),
+            }
+            if len(mod_findings[fp]) < 15:
+                mod_findings[fp].append(item)
+            if len(all_findings) < 300:
+                all_findings.append(item)
+
+        modules: list[dict[str, Any]] = []
+        for path, (block_id, loc) in prod_files.items():
+            modules.append(
+                {
+                    "path": path,
+                    "block_id": block_id,
+                    "package": self._package_name(path),
+                    "loc": loc,
+                    "docstring": mod_docs.get(path, ""),
+                    "symbol_count": symbol_counts.get(path, 0),
+                    "symbols": top_symbols.get(path, []),
+                    "imports": sorted(mod_imports.get(path, ())),
+                    "imported_by": sorted(mod_imported_by.get(path, ())),
+                    "external_libs": sorted(mod_ext_libs.get(path, ())),
+                    "findings": mod_findings.get(path, []),
+                    "test_files": sorted(mod_test_files.get(path, ())),
+                }
+            )
+
+        return {
+            "modules": modules,
+            "block_external_libs": {k: sorted(v) for k, v in block_ext_libs.items()},
+            "all_findings": all_findings,
+        }
+
 
 _DEFAULT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS files (
