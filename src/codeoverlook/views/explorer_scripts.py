@@ -1644,15 +1644,6 @@ function renderFunctionsSvg(fitOnRender) {
     laneMap.get(lk).push(s);
   });
 
-  const labelW = 205;
-  const nodeW = 228;
-  const nodeH = 68;
-  const gapX = 24;
-  const gapY = 24;
-  const padX = 20;
-  const padY = 16;
-  const maxCols = 4;
-
   const lanes = [...laneMap.entries()];
   const maxItems = Math.max(1, ...lanes.map(([, arr]) => arr.length));
   const density = resolveDensity(syms.length);

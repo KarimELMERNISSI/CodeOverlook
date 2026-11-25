@@ -342,3 +342,40 @@ def test_architecture_scales_from_micro_to_large_monorepo() -> None:
     assert l_prof["recommended_density"] == "compact"
     assert l_prof["max_bands"] >= 5
     assert l_prof["blast_in_deg_min"] >= 7
+
+
+def test_explorer_js_has_no_duplicate_scope_declarations() -> None:
+    """Guard against duplicate top-level or function-scope JS `const`/`let` bindings."""
+    import re
+    from collections import Counter
+
+    from codeoverlook.views.explorer_scripts import build_explorer_js
+
+    js = build_explorer_js("{}")
+    top_funcs = re.findall(r"^function\s+(\w+)", js, re.M)
+    assert [k for k, v in Counter(top_funcs).items() if v > 1] == []
+    top_vars = re.findall(r"^(?:const|let)\s+(\w+)\b", js, re.M)
+    assert [k for k, v in Counter(top_vars).items() if v > 1] == []
+
+    current_fn: str | None = None
+    depth = 0
+    fn_decls: dict[str, list[str]] = {}
+    for line in js.splitlines():
+        m_fn = re.match(r"^function\s+(\w+)\s*\(", line)
+        if m_fn and depth == 0:
+            current_fn = m_fn.group(1)
+            fn_decls[current_fn] = []
+        if current_fn is not None and depth == 1:
+            m_var = re.match(r"^\s{2}(?:const|let)\s+(\w+)\b", line)
+            if m_var:
+                fn_decls[current_fn].append(m_var.group(1))
+        depth += line.count("{") - line.count("}")
+        if depth <= 0:
+            depth = 0
+            current_fn = None
+
+    dups = {
+        fn: [name for name, cnt in Counter(decls).items() if cnt > 1]
+        for fn, decls in fn_decls.items()
+    }
+    assert {fn: names for fn, names in dups.items() if names} == {}
