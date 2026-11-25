@@ -1,4 +1,4 @@
-"""Multi-level architecture and test-coverage layout model for the HTML explorer."""
+"""Multi-level architecture, semantic layering, and weakness model for HTML explorer."""
 
 from __future__ import annotations
 
@@ -6,83 +6,8 @@ from collections import defaultdict
 from dataclasses import asdict
 from typing import Any
 
+from codeoverlook.core.architecture import analyze_architecture
 from codeoverlook.core.coverage import RepoCoverageReport
-
-_BAND_SPECS: tuple[tuple[str, str, str, str], ...] = (
-    ("L1", "Entry & Consumers", "entry", "Interfaces, pages, CLI, and top-level workflows"),
-    ("L2", "Application & Services", "services", "Service coordination and intermediate blocks"),
-    ("L3", "Core & Domain", "engine", "Domain logic, analytics, and core engines"),
-    ("L4", "Foundation & Storage", "foundation", "Persistence, exports, and low-level utilities"),
-)
-
-
-def _compute_block_layers(
-    block_ids: list[str],
-    edges: list[tuple[str, str]],
-) -> dict[str, str]:
-    """Assign each production block to an architectural band (`L1`..`L4`) by dependency flow."""
-    if not block_ids:
-        return {}
-
-    adj: dict[str, set[str]] = {bid: set() for bid in block_ids}
-    rev: dict[str, set[str]] = {bid: set() for bid in block_ids}
-    for src, dst in edges:
-        if src in adj and dst in adj and src != dst:
-            adj[src].add(dst)
-            rev[dst].add(src)
-
-    # Condense strongly connected cycles via greedy topological layering:
-    # nodes with fewer remaining callers sit higher (`L1`), leaf providers sit lower (`L4`).
-    remaining = set(block_ids)
-    depth: dict[str, int] = {bid: 0 for bid in block_ids}
-    ordered_layers: list[str] = []
-
-    while remaining:
-        roots = sorted(
-            [bid for bid in remaining if not (rev[bid] & remaining)],
-            key=lambda bid: (-len(adj[bid]), bid),
-        )
-        if not roots:
-            # Break cycle by choosing node with fewest incoming edges inside remaining set.
-            roots = [
-                min(
-                    remaining,
-                    key=lambda bid: (len(rev[bid] & remaining), -len(adj[bid]), bid),
-                )
-            ]
-        for node in roots:
-            remaining.remove(node)
-            ordered_layers.append(node)
-
-    for node in ordered_layers:
-        for dst in adj[node]:
-            if depth[dst] < depth[node] + 1:
-                depth[dst] = depth[node] + 1
-
-    # Leaf nodes with zero outgoing imports belong at the bottom-most tier.
-    max_depth = max(depth.values(), default=0)
-    if max_depth == 0:
-        return {bid: "L1" for bid in block_ids}
-
-    for bid in block_ids:
-        if not adj[bid] and rev[bid]:
-            depth[bid] = max(depth[bid], max_depth)
-
-    # Compress active depth levels into up to 4 contiguous bands (`L1`..`L4`).
-    distinct = sorted(set(depth.values()))
-    if len(distinct) <= 4:
-        tier_map = {val: f"L{idx + 1}" for idx, val in enumerate(distinct)}
-    else:
-        max_d = distinct[-1]
-        tier_map = {
-            val: f"L{min(4, 1 + (val * 3) // max(1, max_d))}"
-            for val in distinct
-        }
-
-    # Ensure band labels stay strictly contiguous (`L1`, `L2`, ...) with no gaps.
-    used_nums = sorted({int(tier_map[d][1:]) for d in depth.values()})
-    remap = {f"L{num}": f"L{idx + 1}" for idx, num in enumerate(used_nums)}
-    return {bid: remap[tier_map[depth[bid]]] for bid in block_ids}
 
 
 def _classify_package_status(tested_files: int, total_files: int) -> str:
@@ -105,12 +30,13 @@ def build_explorer_model(
     violations: list[dict[str, Any]],
     catalog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the synchronized 3-level data model consumed by `html_renderer.py`.
+    """Build the synchronized multi-level architecture and coverage model.
 
     Levels:
-    1. `blocks`: functional blocks layered automatically into architectural bands.
+    1. `blocks`: functional blocks layered via Tarjan SCCs and semantic roles.
     2. `packages`: sub-package bricks within each functional block.
     3. `modules`: production modules with docstrings, symbols, imports, and findings.
+    4. `symbol_graph`: intra-block and intra-module function/class call graphs.
     """
     risk_by_block = {str(r["block_id"]): r for r in block_summary}
     violation_map: dict[tuple[str, str], str] = {
@@ -119,24 +45,20 @@ def build_explorer_model(
     }
 
     import_deps = [d for d in dependencies if d.get("kind") == "IMPORTS"]
-    block_ids = [b.block_id for b in coverage.blocks]
-    block_bands = _compute_block_layers(
-        block_ids,
-        [(str(d["src_block"]), str(d["dst_block"])) for d in import_deps],
-    )
+    block_ids_set = {b.block_id for b in coverage.blocks}
 
     block_imports: dict[str, list[str]] = defaultdict(list)
     block_imported_by: dict[str, list[str]] = defaultdict(list)
-    block_edges: list[dict[str, Any]] = []
+    raw_block_edges: list[dict[str, Any]] = []
     for dep in import_deps:
         u = str(dep["src_block"])
         v = str(dep["dst_block"])
-        if u not in block_bands or v not in block_bands:
+        if u not in block_ids_set or v not in block_ids_set:
             continue
         block_imports[u].append(v)
         block_imported_by[v].append(u)
         reason = violation_map.get((u, v), "")
-        block_edges.append(
+        raw_block_edges.append(
             {
                 "u": u,
                 "v": v,
@@ -149,6 +71,9 @@ def build_explorer_model(
     raw_modules = list((catalog or {}).get("modules", []))
     block_ext_libs = dict((catalog or {}).get("block_external_libs", {}))
     all_findings = list((catalog or {}).get("all_findings", []))
+    symbol_graph = dict(
+        (catalog or {}).get("symbol_graph", {"by_module": {}, "by_block": {}})
+    )
 
     modules_by_block: dict[str, list[dict[str, Any]]] = defaultdict(list)
     modules_by_pkg: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -166,7 +91,8 @@ def build_explorer_model(
         entry = {
             **mod,
             "package_id": pkg_id,
-            "band": block_bands.get(bid, "L1"),
+            "band": "L1",
+            "zone": "production",
             "tested": bool(mod.get("test_files")),
             "sinks": sinks_cnt,
         }
@@ -219,7 +145,8 @@ def build_explorer_model(
                 "id": pkg_id,
                 "title": pkg_name if pkg_name != "root" else f"{bid} (root)",
                 "block_id": bid,
-                "band": block_bands.get(bid, "L1"),
+                "band": "L1",
+                "zone": "production",
                 "prod_files": total_files,
                 "tested_files": tested_files,
                 "file_coverage_pct": round((tested_files / max(1, total_files)) * 100.0, 1),
@@ -272,7 +199,7 @@ def build_explorer_model(
                 "id": blk.block_id,
                 "block_id": blk.block_id,
                 "title": blk.block_id,
-                "band": block_bands.get(blk.block_id, "L1"),
+                "band": "L1",
                 "prod_files": blk.prod_files,
                 "tested_files": blk.tested_files,
                 "file_coverage_pct": blk.file_coverage_pct,
@@ -303,20 +230,48 @@ def build_explorer_model(
             }
         )
 
-    active_band_ids = {b["band"] for b in blocks_payload}
-    bands = [
-        {"id": bid, "label": bid, "group": grp, "title": title, "desc": desc}
-        for bid, title, grp, desc in _BAND_SPECS
-        if bid in active_band_ids
-    ]
+    # Enrich blocks, packages, modules, bands, features, and weaknesses semantically.
+    arch = analyze_architecture(
+        blocks_payload=blocks_payload,
+        block_edges=raw_block_edges,
+        packages_payload=packages_payload,
+        modules_payload=enriched_modules,
+        cycles=cycles,
+        violations=violations,
+    )
+
+    metrics = arch["block_metrics"]
+    for b in blocks_payload:
+        bm = metrics.get(b["id"], {})
+        b["zone"] = bm.get("zone", "production")
+        b["role"] = bm.get("role", "service")
+        b["role_summary"] = bm.get("role_summary", "")
+        b["band"] = bm.get("band", "L1")
+        b["instability"] = bm.get("instability", 0.0)
+        b["blast_radius"] = bm.get("blast_radius", 0.0)
+        b["cycle_count"] = bm.get("cycle_count", 0)
+        b["back_edge_count"] = bm.get("back_edge_count", 0)
+        b["weakness_tags"] = bm.get("weakness_tags", [])
+
+    for pkg in packages_payload:
+        bm = metrics.get(pkg["block_id"], {})
+        pkg["band"] = bm.get("band", "L1")
+        pkg["zone"] = bm.get("zone", "production")
+
+    for mod in enriched_modules:
+        bm = metrics.get(mod["block_id"], {})
+        mod["band"] = bm.get("band", "L1")
+        mod["zone"] = bm.get("zone", "production")
+
+    bands = arch["bands"]
     if not bands:
         bands = [
             {
                 "id": "L1",
                 "label": "L1",
                 "group": "entry",
-                "title": _BAND_SPECS[0][1],
-                "desc": _BAND_SPECS[0][3],
+                "title": "Architecture Blocks",
+                "desc": "Primary module grouping",
             }
         ]
 
@@ -350,11 +305,16 @@ def build_explorer_model(
             "violations_count": len(violations),
         },
         "bands": bands,
+        "tooling_blocks": arch["tooling_blocks"],
         "blocks": blocks_payload,
-        "block_edges": block_edges,
+        "block_edges": arch["block_edges"],
         "packages": packages_payload,
         "package_edges": package_edges,
         "modules": enriched_modules,
+        "features": arch["features"],
+        "diagnosis": arch["diagnosis"],
+        "god_modules": arch["god_modules"],
+        "symbol_graph": symbol_graph,
         "cycles": cycles[:30],
         "violations": violations,
         "findings": all_findings,
