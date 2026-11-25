@@ -656,17 +656,54 @@ class FactStore:
         block_ext_libs: dict[str, set[str]] = defaultdict(set)
         mod_test_files: dict[str, set[str]] = defaultdict(set)
 
+        prod_symbols: dict[str, dict[str, Any]] = {}
+        symbols_by_file: dict[str, list[str]] = defaultdict(list)
+        symbols_by_block: dict[str, list[str]] = defaultdict(list)
         for row in self.conn.execute(
-            "SELECT src_id, dst_id, kind, target_scope FROM edges;"
+            """
+            SELECT id, file_path, kind, name, qualname, signature, start_line, end_line
+            FROM symbols
+            WHERE kind != 'module'
+            ORDER BY file_path ASC, start_line ASC;
+            """
         ).fetchall():
-            src_file = self._file_from_node(str(row["src_id"]))
+            fp = str(row["file_path"])
+            if fp not in prod_files:
+                continue
+            sid = str(row["id"])
+            blk = prod_files[fp][0]
+            sig_raw = str(row["signature"])
+            sig_short = sig_raw if len(sig_raw) <= 96 else (sig_raw[:93] + "...")
+            prod_symbols[sid] = {
+                "id": sid,
+                "name": str(row["name"]),
+                "qualname": str(row["qualname"]),
+                "kind": str(row["kind"]),
+                "file_path": fp,
+                "block_id": blk,
+                "line": int(row["start_line"]),
+                "end_line": int(row["end_line"]),
+                "signature": sig_short,
+                "tested": False,
+                "sinks": 0,
+                "degree": 0,
+            }
+            symbols_by_file[fp].append(sid)
+            symbols_by_block[blk].append(sid)
+
+        sym_edges: list[tuple[str, str, str, int]] = []
+        for row in self.conn.execute(
+            "SELECT src_id, dst_id, kind, target_scope, weight FROM edges;"
+        ).fetchall():
+            src_raw = str(row["src_id"])
+            src_file = self._file_from_node(src_raw)
             dst_raw = str(row["dst_id"])
             scope = str(row["target_scope"])
             kind = str(row["kind"])
 
-            if scope == "EXTERNAL" and src_file in prod_files:
+            if kind == "IMPORTS" and scope == "EXTERNAL" and src_file in prod_files:
                 pkg = dst_raw.split(".", 1)[0]
-                if pkg:
+                if pkg and not pkg.startswith("_"):
                     mod_ext_libs[src_file].add(pkg)
                     block_ext_libs[prod_files[src_file][0]].add(pkg)
             elif scope == "INTERNAL":
@@ -681,12 +718,25 @@ class FactStore:
                     mod_imported_by[dst_file].add(src_file)
                 elif src_file in test_files and dst_file in prod_files:
                     mod_test_files[dst_file].add(src_file)
+                    if dst_raw in prod_symbols:
+                        prod_symbols[dst_raw]["tested"] = True
+
+                if (
+                    kind in {"CALLS", "INHERITS"}
+                    and src_raw in prod_symbols
+                    and dst_raw in prod_symbols
+                    and src_raw != dst_raw
+                ):
+                    weight = int(row["weight"])
+                    sym_edges.append((src_raw, dst_raw, kind, weight))
+                    prod_symbols[src_raw]["degree"] += 1
+                    prod_symbols[dst_raw]["degree"] += 1
 
         mod_findings: dict[str, list[dict[str, Any]]] = defaultdict(list)
         all_findings: list[dict[str, Any]] = []
         for row in self.conn.execute(
             """
-            SELECT file_path, rule_id, severity, category, line, message
+            SELECT file_path, symbol_id, rule_id, severity, category, line, message
             FROM findings
             ORDER BY
                 CASE severity
@@ -703,6 +753,9 @@ class FactStore:
             fp = str(row["file_path"])
             if fp not in prod_files:
                 continue
+            sid = row["symbol_id"]
+            if sid and str(sid) in prod_symbols:
+                prod_symbols[str(sid)]["sinks"] += 1
             item = {
                 "file_path": fp,
                 "block_id": prod_files[fp][0],
@@ -716,6 +769,35 @@ class FactStore:
                 mod_findings[fp].append(item)
             if len(all_findings) < 300:
                 all_findings.append(item)
+
+        def _pack_symbol_subgraph(
+            candidate_ids: list[str],
+            limit: int,
+        ) -> dict[str, Any]:
+            ranked = sorted(
+                (prod_symbols[sid] for sid in candidate_ids),
+                key=lambda s: (-int(s["degree"]), -int(s["sinks"]), str(s["file_path"]), s["line"]),
+            )[:limit]
+            keep = {s["id"] for s in ranked}
+            packed_edges = [
+                {"u": u, "v": v, "kind": k, "w": w}
+                for u, v, k, w in sym_edges
+                if u in keep and v in keep
+            ]
+            # Sort back into file + line order for clean swimlane rendering.
+            ranked.sort(key=lambda s: (str(s["file_path"]), int(s["line"])))
+            return {"symbols": ranked, "edges": packed_edges}
+
+        by_module_graph = {
+            fp: _pack_symbol_subgraph(sids, 10)
+            for fp, sids in symbols_by_file.items()
+            if sids
+        }
+        by_block_graph = {
+            blk: _pack_symbol_subgraph(sids, 24)
+            for blk, sids in symbols_by_block.items()
+            if sids
+        }
 
         modules: list[dict[str, Any]] = []
         for path, (block_id, loc) in prod_files.items():
@@ -740,6 +822,37 @@ class FactStore:
             "modules": modules,
             "block_external_libs": {k: sorted(v) for k, v in block_ext_libs.items()},
             "all_findings": all_findings,
+            "symbol_graph": {
+                "by_module": by_module_graph,
+                "by_block": by_block_graph,
+            },
+        }
+
+    def get_symbol_call_graph(
+        self,
+        scope_kind: str,
+        scope_id: str,
+        max_symbols: int = 80,
+    ) -> dict[str, Any]:
+        """Return internal symbol call/inheritance subgraph for a block or module."""
+        catalog = self.get_explorer_catalog()
+        sg = catalog["symbol_graph"]
+        if scope_kind == "module":
+            return sg["by_module"].get(scope_id, {"symbols": [], "edges": []})
+        if scope_kind == "block":
+            return sg["by_block"].get(scope_id, {"symbols": [], "edges": []})
+        mods = [m["path"] for m in catalog["modules"] if m.get("package") == scope_id]
+        symbols: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        for path in mods:
+            sub = sg["by_module"].get(path)
+            if sub:
+                symbols.extend(sub["symbols"])
+                edges.extend(sub["edges"])
+        keep = {s["id"] for s in symbols[:max_symbols]}
+        return {
+            "symbols": [s for s in symbols if s["id"] in keep],
+            "edges": [e for e in edges if e["u"] in keep and e["v"] in keep],
         }
 
 
