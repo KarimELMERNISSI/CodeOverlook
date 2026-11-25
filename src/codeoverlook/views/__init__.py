@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from codeoverlook.views.explorer_layout import build_explorer_model
 from codeoverlook.views.html_renderer import render_atlas_html
 from codeoverlook.views.markdown import (
     format_findings_lines,
@@ -13,6 +14,7 @@ from codeoverlook.views.mermaid import render_block_mermaid, render_coverage_mer
 from codeoverlook.views.workbench import render_workbench_html
 
 __all__ = [
+    "build_explorer_model",
     "format_findings_lines",
     "format_header",
     "format_neighbor_line",
